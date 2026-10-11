@@ -1548,8 +1548,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/rdna/dsv4/kv_insert.cu"
       "csrc/rocm/rdna/dsv4/mhc.cu"
       "csrc/rocm/rdna/dsv4/sparse_mla_decode.cu"
-      # Glm5Next gfx1030 kernels. fp16 fdot2 only; the recurrent entry is
-      # scalar fp32 for fp16 and bf16. Not built for gfx1100.
+      # Glm5Next kernels. Listed with the other gfx1030 sources. A mixed
+      # gfx1030;gfx1100 build still compiles each of these TUs for every
+      # arch in VLLM_GPU_ARCHES, including gfx1100. That is harmless:
+      # fp16 fdot2 exists on gfx1100, and the recurrent kernel is scalar
+      # fp32 for both fp16 and bf16 (no bf16 fdot2).
       "csrc/rocm/rdna/glm5next/glm5_kda_recurrent_rdna2.cu"
       "csrc/rocm/rdna/glm5next/glm5_kda_decode_rdna2.cu"
       "csrc/rocm/rdna/glm5next/glm5_kda_prefill_prep_rdna2.cu"

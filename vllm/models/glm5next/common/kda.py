@@ -39,6 +39,9 @@ from vllm.models.glm5next.amd.rdna.ops import (
     glm5_kda_recurrent,
     has_glm5_kda_recurrent,
 )
+from vllm.models.glm5next.common.dense_leftovers import (
+    require_glm5_dense_leftover,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.rdna import on_rdna_family
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -121,8 +124,13 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
                 param.tp_rank = param_tp_rank
 
 
-# Default on for gfx1030/gfx11/gfx12. Set to 0 to keep the Triton recurrence.
-_GLM5_KDA_HIP = os.environ.get("VLLM_GLM5_KDA_HIP", "1") != "0"
+def _glm5_kda_hip_enabled() -> bool:
+    """Return whether the gfx1030 KDA HIP decode kernel is requested.
+
+    Opt-in. Unset and ``0`` keep Triton ``fused_recurrent_kda``. Set
+    ``VLLM_GLM5_KDA_HIP=1`` after the kernel has been checked on hardware.
+    """
+    return os.environ.get("VLLM_GLM5_KDA_HIP", "0") == "1"
 
 
 @torch.compile(
@@ -198,7 +206,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        # If this checkpoint actually quantized them, fail instead of
+        # building an unquantized linear over packed weights.
         saved_quant_config = vllm_config.quant_config
+        for name, cls_name in (
+            ("in_proj_qkvbfg_a", "MergedColumnParallelLinear"),
+            ("f_b_proj", "ColumnParallelLinear"),
+        ):
+            require_glm5_dense_leftover(
+                saved_quant_config,
+                f"{prefix}.{name}",
+                "KDA projection",
+                cls_name,
+            )
         try:
             vllm_config.quant_config = None
             super().__init__(config, vllm_config, prefix)
@@ -441,7 +461,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             True when the HIP kernel wrote ``out`` and ``recurrent_state``.
         """
         if (
-            not _GLM5_KDA_HIP
+            not _glm5_kda_hip_enabled()
             or not on_rdna_family()
             or not has_glm5_kda_recurrent()
             or self.head_dim != 128

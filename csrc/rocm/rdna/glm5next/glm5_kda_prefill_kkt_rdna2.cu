@@ -33,7 +33,9 @@
 //
 // Workgroup = one (chunk, head); grid = (NT, H); 256 threads, each owns
 // a 4x4 sub-tile of the [64, 64] output. LDS: s_k [64,128] fp16 (16 KB)
-// + s_g [64,128] fp32 (32 KB) = 48 KB. Output layout (documented):
+// + s_g [64,128] fp32 (32 KB) = 48 KB per 256-thread workgroup, so two
+// workgroups fit on a WGP. This prefill kernel is not on the default
+// path (the Python model keeps Triton prefill). Output layout:
 //   A_out [NT, H, 64, 64] fp32, A_out[((i_tg*H + i_h)*64 + i)*64 + j].
 //
 // PERF NOTE (first cut): 16 expf per inner dim per thread = 2048

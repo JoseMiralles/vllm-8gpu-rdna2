@@ -152,7 +152,7 @@ __global__ void glm5_kda_prefill_prep_rdna2_kernel(
       float ss = 0.0f;
 #pragma unroll
       for (int j = 0; j < GLM5_PREP_D / 2; ++j) ss += y_local[j] * y_local[j];
-      ss += __shfl_xor_sync(0xffffffffu, ss, 1);
+      ss += __shfl_xor_sync(0xffffffffffffffffULL, ss, 1);
       const float inv = 1.0f / sqrtf(ss + GLM5_PREP_L2NORM_EPS);
 #pragma unroll
       for (int j = 0; j < GLM5_PREP_D / 2; ++j) y_local[j] *= inv;

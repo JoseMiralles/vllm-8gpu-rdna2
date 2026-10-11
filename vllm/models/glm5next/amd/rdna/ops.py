@@ -24,6 +24,23 @@ def _has_op(name: str) -> bool:
     return True
 
 
+def glm5_kda_slot_is_empty(slot: int, num_slots: int) -> bool:
+    """Return whether a KDA state slot must not be read or written.
+
+    Matches ``glm5_kda_slot_is_empty`` in ``glm5_kda_slot.cuh`` and
+    ``fused_recurrent_kda`` (``state_idx <= 0``). ``NULL_BLOCK_ID`` is 0
+    and ``PAD_SLOT_ID`` is -1.
+
+    Args:
+        slot: State index from the scheduler.
+        num_slots: Length of the recurrent-state buffer.
+
+    Returns:
+        True when the slot is padding, the null block, or out of range.
+    """
+    return int(slot) <= 0 or int(slot) >= int(num_slots)
+
+
 def has_glm5_kda_recurrent() -> bool:
     return _has_op("glm5_kda_recurrent_rdna2")
 
@@ -51,7 +68,8 @@ def glm5_kda_recurrent(
         beta: Raw beta, ``[1, T, H]`` or ``[T, H]``.
         a_log: Per-head fp32 ``A_log``.
         dt_bias: fp32 ``[H * 128]``.
-        state_indices: int32 slots, length ``T``. Slot 0 is left untouched.
+        state_indices: int32 slots, length ``T``. Slot 0 (NULL_BLOCK_ID)
+            and negative slots (PAD_SLOT_ID is -1) are left untouched.
         ssm_state: fp32 ``[slots, H, 128, 128]`` in ``[V, K]`` order.
         out: Pre-norm output, same shape and dtype as ``q``.
         lower_bound: Bounded-gate floor.

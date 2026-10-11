@@ -9,14 +9,16 @@
 // It does not touch conv state and does not apply RMSNorm.
 //
 // State layout matches the Triton kernel: ``[slots, H, V, K]`` with K
-// contiguous (``o_v * K + o_k``). Slot 0 is NULL_BLOCK_ID and is left
-// untouched. Activations are fp16 or bf16. bf16 values are widened to fp32
-// with a bit shift and stored back with round-to-nearest-even. Dots are
-// scalar fp32 multiplies. Packed bf16 dots are not used.
+// contiguous (``o_v * K + o_k``). NULL_BLOCK_ID (0) and PAD_SLOT_ID (-1)
+// are empty: output is zeroed and the state is left untouched, matching
+// fused_recurrent_kda (state_idx <= 0). Activations are fp16 or bf16.
+// bf16 values are widened to fp32 with a bit shift and stored back with
+// round-to-nearest-even. Dots are scalar fp32 multiplies. Packed bf16
+// dots are not used.
 //
 // One wave32-friendly workgroup per (token, head): 1024 threads, 128 v-rows
 // by 8 k-slices of 16. gfx1030 is wave32; the k-slice butterfly uses mask
-// 0xffffffffu.
+// 0xffffffffffffffffULL.
 
 #include <cstdint>
 
@@ -26,6 +28,8 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+
+#include "glm5_kda_slot.cuh"
 
 namespace {
 
@@ -37,9 +41,9 @@ constexpr float kQkScale = 0.08838834764831845f;  // 1/sqrt(128)
 enum class ActKind { kF16, kBF16 };
 
 __device__ __forceinline__ float ksum8(float x) {
-  x += __shfl_xor_sync(0xffffffffu, x, 1);
-  x += __shfl_xor_sync(0xffffffffu, x, 2);
-  x += __shfl_xor_sync(0xffffffffu, x, 4);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 1);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 2);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 4);
   return x;
 }
 
@@ -100,7 +104,7 @@ __global__ void glm5_kda_recurrent_rdna2_kernel(
   const int k0 = ks * 16;
 
   const long slot = static_cast<long>(state_indices[i_n * idx_s0]);
-  if (slot <= 0 || slot >= num_slots) {
+  if (glm5_kda_slot_is_empty(slot, num_slots)) {
     if (ks == 0) {
       store_act<Kind>(out, i_n * out_s0 + i_h * out_s1 + v_local, 0.0f);
     }

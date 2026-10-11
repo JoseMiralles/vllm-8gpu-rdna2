@@ -65,9 +65,9 @@ constexpr int GLM5_DH_THREADS = 256;  // 32 v-rows x 8 k-slices
 
 // Reduction across the 8 k-slice lanes sharing one v-row.
 __device__ __forceinline__ float glm5_kda_ksum(float x) {
-  x += __shfl_xor_sync(0xffffffffu, x, 1);
-  x += __shfl_xor_sync(0xffffffffu, x, 2);
-  x += __shfl_xor_sync(0xffffffffu, x, 4);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 1);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 2);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 4);
   return x;
 }
 
