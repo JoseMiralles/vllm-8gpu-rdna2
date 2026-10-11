@@ -56,6 +56,16 @@ def test_rdna_family_check_is_not_sm100(monkeypatch: pytest.MonkeyPatch):
         classmethod(lambda cls, device_id=0: DeviceCapability(11, 0)),
     )
     assert rocm.RocmPlatform.is_device_capability_family(110) is False
+    assert rocm.RocmPlatform.is_device_capability_family(120) is False
+
+    # gfx12 aliases SM120 the same way gfx1030 aliases SM100.
+    monkeypatch.setattr(
+        rocm.RocmPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(12, 0)),
+    )
+    assert rocm.RocmPlatform.is_device_capability_family(120) is False
+    assert rocm.RocmPlatform.is_device_capability_family(100) is False
 
     # CDNA keeps the generic family test.
     monkeypatch.setattr(rocm, "on_gfx10x", lambda: False)
