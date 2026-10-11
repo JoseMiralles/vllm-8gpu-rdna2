@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 import torch
 
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     _awq_uint8_qzeros_to_rdna2,
 )
