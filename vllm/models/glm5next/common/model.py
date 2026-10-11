@@ -81,6 +81,7 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna_family
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
@@ -211,11 +212,14 @@ class Glm5NextMoE(nn.Module):
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
+            # Shared experts stay dense on RDNA. The AWQ checkpoint leaves
+            # them in bf16, and a W4A16 kernel would cast those activations.
+            shared_quant = None if on_rdna_family() else quant_config
             self.shared_experts = Glm5NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=shared_quant,
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
@@ -945,10 +949,12 @@ class Glm5NextForCausalLM(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
+            # lm_head stays dense on RDNA so a bf16 head is not cast to fp16.
+            lm_quant = None if on_rdna_family() else quant_config
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
                 self.config.hidden_size,
-                quant_config=quant_config,
+                quant_config=lm_quant,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

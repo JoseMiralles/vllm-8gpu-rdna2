@@ -658,6 +658,22 @@ class RocmPlatform(Platform):
     ]
 
     @classmethod
+    def is_device_capability_family(
+        cls,
+        capability: int,
+        device_id: int = 0,
+    ) -> bool:
+        """RDNA reports gfx10/11/12 as CUDA-like (10, x)/(11, x)/(12, x).
+
+        ``(10, 3)`` for gfx1030 would otherwise match the SM100 family
+        (``to_int() // 10 == 10``) and pick Blackwell fp8-KV defaults.
+        RDNA is not that family. CDNA (gfx9, gfx1250) keeps the generic test.
+        """
+        if on_gfx10x() or on_rdna():
+            return False
+        return super().is_device_capability_family(capability, device_id)
+
+    @classmethod
     def import_kernels(cls) -> None:
         """Import ROCm-specific kernels."""
         super().import_kernels()
