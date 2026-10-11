@@ -7,19 +7,21 @@
 #   hwconfig/check-host.sh --unit NAME           # also check the memlock limit of systemd user unit NAME
 #   hwconfig/check-host.sh --cooling PROCESS     # also check that a cooling/fan-control process is running
 #   hwconfig/check-host.sh --no-offload          # the CPU KV tier is not used: memory items become INFO
+#   hwconfig/check-host.sh --memmap 4K\$0xADDR  # also check that a bad-RAM page stays reserved (repeatable)
 #   V620_POWER=140 V620_SCLK=2300 hwconfig/check-host.sh   # override single targets (as with cardinit arguments)
 #
 # Exit status: number of FAIL lines (0 = all good).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CARDINIT="$HERE/cardinit/cardinit"; UNIT=""; COOLING=""; OFFLOAD=1
+CARDINIT="$HERE/cardinit/cardinit"; UNIT=""; COOLING=""; OFFLOAD=1; MEMMAPS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --cardinit) CARDINIT="$2"; shift 2 ;;
     --unit) UNIT="$2"; shift 2 ;;
     --cooling) COOLING="$2"; shift 2 ;;
     --no-offload) OFFLOAD=0; shift ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    --memmap) MEMMAPS+=("$2"); shift 2 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -45,6 +47,15 @@ if [ -n "$mask" ]; then
   if (( mask & 0x8000 )); then warn "ppfeaturemask $mask has GFXOFF (0x8000) enabled; production clears it"; else ok "ppfeaturemask clears GFXOFF (0x8000)"; fi
 fi
 [[ "$CMDLINE" == *" pci=nomsi"* ]] && fail "cmdline has pci=nomsi: forces legacy shared interrupts, remove it"
+# Bad host-RAM pages excluded with memmap=SIZE$ADDR (no ECC on many hosts: a stuck bit corrupts silently). A
+# mis-escaped GRUB line drops the '$' and the kernel ignores it, so check both the cmdline and the boot RAM map.
+for mm in ${MEMMAPS[@]+"${MEMMAPS[@]}"}; do
+  addr=$(printf '%x' "$(( ${mm#*\$} ))")
+  if [[ "$CMDLINE" != *" memmap=$mm"* ]]; then fail "cmdline lacks memmap=$mm (bad RAM page back in use)"
+  elif journalctl -k -b --no-pager 2>/dev/null | grep -Eiq "user: \[mem 0x0*${addr}-.*reserved"; then
+    ok "memmap=$mm: page 0x$addr reserved in the boot RAM map"
+  else warn "cmdline has memmap=$mm but the kernel log shows no 'user: [mem 0x$addr' reserved line"; fi
+done
 
 # ---------------------------------------------------------------------------------------------------------------
 echo "== GPUs   (hwconfig/cardinit/: run cardinit after every boot)"

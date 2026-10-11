@@ -5,7 +5,7 @@ go down this table, then run [`check-host.sh`](check-host.sh)**: it checks every
 running system and points at the fix for each failure.
 
 ```sh
-hwconfig/check-host.sh --cardinit <your cardinit copy> --unit <user unit that starts vLLM> --cooling <fan process>
+hwconfig/check-host.sh --cardinit <your cardinit copy> --unit <user unit that starts vLLM> --cooling <fan process> [--memmap <SIZE$ADDR of an excluded bad-RAM page>]
 ```
 
 | What | Source of truth | Made persistent by | Needed for | If missing |
