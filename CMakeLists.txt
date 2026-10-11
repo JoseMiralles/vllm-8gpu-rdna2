@@ -1560,7 +1560,18 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/rdna/dsv4/indexer_mqa_logits.cu"
       "csrc/rocm/rdna/dsv4/kv_insert.cu"
       "csrc/rocm/rdna/dsv4/mhc.cu"
-      "csrc/rocm/rdna/dsv4/sparse_mla_decode.cu")
+      "csrc/rocm/rdna/dsv4/sparse_mla_decode.cu"
+      # Glm5Next gfx1030 kernels. fp16 fdot2 only; the recurrent entry is
+      # scalar fp32 for fp16 and bf16. Not built for gfx1100.
+      "csrc/rocm/rdna/glm5next/glm5_kda_recurrent_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_kda_decode_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_kda_prefill_prep_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_kda_prefill_kkt_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_kda_prefill_solve_wy_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_kda_prefill_delta_h_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_kda_prefill_o_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_dsa_indexer_rdna2.cu"
+      "csrc/rocm/rdna/glm5next/glm5_dsa_mla_decode_rdna2.cu")
     # moe_w8a16_fp8_rdna2.cu excluded from gfx1030 build (namespace parser
     # error per rdna2_extras commit 9ac015d0a9 / AGENTS.md 2026-08-05).
     # MoE experts fall back to existing CompressedTensorsWNA16MoEMethod
