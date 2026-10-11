@@ -76,6 +76,19 @@ import os as _os
 from vllm.v1.core.single_type_kv_cache_manager import prompt_tail_boundary
 _RETENTION_STOPS = _os.getenv("VLLM_RDNA_MAMBA_RETENTION_STOPS", "1") == "1"
 _TAIL_STOP = _os.getenv("VLLM_RDNA_MAMBA_TAIL_STOP", "1") == "1"
+# gfx1030 fork, 2026-10-11 (VLLM_RDNA_OVERLAP_STEP_TOKENS, default 0 = off): while any request is decoding, cap each
+# step at this many tokens in total -- the decodes plus at most (cap - decode tokens) prefill tokens. A full 2048-token
+# prefill chunk makes a step ~1.3 s, so a request decoding next to a long prefill got < 1 token/s until the prefill
+# finished. Smaller overlapped steps keep decode moving at the cost of a slower prefill during the overlap; with no
+# decode running, prefill keeps the full --max-num-batched-tokens chunk. The step total stays <= the cap; caps of
+# 128/256 (HIP-graph capture sizes) then pad to exactly that M, which has tuned TunableOp rows.
+_OVERLAP_STEP_TOKENS = int(_os.getenv("VLLM_RDNA_OVERLAP_STEP_TOKENS", "0"))
+# gfx1030 fork, 2026-10-11 (VLLM_RDNA_OVERLAP_DECODE_STEPS, default 0 = off): after a step that ran prefill while a
+# request was decoding, run this many decode-only steps before the next prefill chunk. Measured 10-11 with the step
+# cap above: a mixed step costs ~0.1-0.2 s however small (MoE weight reads, 2 all-reduces/layer, eager launches), so
+# 512/256/128-token caps gave only 1.4-2.3 tok/s decode and halved prefill. A decode-only step is ~15 ms and graph
+# captured, so alternating full prefill chunks with K decode steps gives decode ~K tokens per (chunk + K x 15 ms).
+_OVERLAP_DECODE_STEPS = int(_os.getenv("VLLM_RDNA_OVERLAP_DECODE_STEPS", "0"))
 
 
 class Scheduler(SchedulerInterface):
@@ -93,6 +106,8 @@ class Scheduler(SchedulerInterface):
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
+        # VLLM_RDNA_OVERLAP_DECODE_STEPS: decode-only steps still owed before the next prefill chunk
+        self._rdna_decode_burst_left = 0
         self.lora_config = vllm_config.lora_config
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.model_uses_xdrope = vllm_config.model_config.uses_xdrope
@@ -609,6 +624,37 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # Decode-aware prefill cap (VLLM_RDNA_OVERLAP_STEP_TOKENS): None = uncapped.
+        prefill_budget: int | None = None
+        decode_tokens = 0
+        if _OVERLAP_STEP_TOKENS > 0 or _OVERLAP_DECODE_STEPS > 0:
+            decode_tokens = sum(
+                1 + self.num_spec_tokens
+                for r in self.running
+                if r.num_computed_tokens >= r.num_prompt_tokens
+            )
+            if not decode_tokens:
+                self._rdna_decode_burst_left = 0
+            elif self._rdna_decode_burst_left > 0:
+                # decode burst: no prefill this step
+                prefill_budget = 0
+                self._rdna_decode_burst_left -= 1
+                logger.info_once(
+                    "RDNA decode bursts active: %d decode-only steps after each prefill step while decoding",
+                    _OVERLAP_DECODE_STEPS,
+                )
+            elif _OVERLAP_STEP_TOKENS > 0:
+                # prefill chunk ends are block aligned (4-token QSA granularity here); keep the step total <= the cap
+                # so a cap that is a HIP-graph capture size (128, 256) pads by only a few tokens to exactly that M
+                bs = self.cache_config.block_size
+                prefill_budget = max((_OVERLAP_STEP_TOKENS - decode_tokens) // bs * bs, 0)
+                logger.info_once(
+                    "RDNA overlap cap active: step <= %d tokens while decoding (scheduler block %d)",
+                    _OVERLAP_STEP_TOKENS, bs,
+                )
+
+        prefill_tokens_scheduled = 0
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -654,6 +700,12 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            is_prefill = request.num_computed_tokens < request.num_prompt_tokens
+            if prefill_budget is not None and is_prefill:
+                num_new_tokens = min(num_new_tokens, prefill_budget)
+                if num_new_tokens <= 0:
+                    req_index += 1
+                    continue
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -788,6 +840,10 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if is_prefill:
+                prefill_tokens_scheduled += num_new_tokens
+                if prefill_budget is not None:
+                    prefill_budget -= num_new_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -1014,6 +1070,11 @@ class Scheduler(SchedulerInterface):
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
+                    if prefill_budget is not None:
+                        # a waiting request always starts with a prefill
+                        if prefill_budget <= 0:
+                            break
+                        request_token_budget = min(request_token_budget, prefill_budget)
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -1241,6 +1302,9 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                prefill_tokens_scheduled += num_new_tokens
+                if prefill_budget is not None:
+                    prefill_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1275,6 +1339,10 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        # VLLM_RDNA_OVERLAP_DECODE_STEPS: a prefill step next to a decode owes K decode-only steps
+        if _OVERLAP_DECODE_STEPS > 0 and decode_tokens and prefill_tokens_scheduled:
+            self._rdna_decode_burst_left = _OVERLAP_DECODE_STEPS
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
