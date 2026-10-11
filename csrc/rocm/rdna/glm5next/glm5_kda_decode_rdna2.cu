@@ -36,9 +36,11 @@
 //      the gate is widened fp16 -> fp32 and sigmoided in fp32 (NO fp16
 //      round-trip; reference gate.to(torch.float32)), result fp16.
 //
-// Invalid state_indices (< 0 or >= slots): the head's 128 output rows are
-// zeroed and BOTH states (conv_state, ssm_state) are left untouched. The
-// guard depends only on i_n, so the early return is workgroup-uniform.
+// Invalid state_indices (NULL_BLOCK_ID 0, PAD_SLOT_ID -1, or >= slots):
+// the head's 128 output rows are zeroed and BOTH states (conv_state,
+// ssm_state) are left untouched. Same predicate as glm5_kda_recurrent
+// and fused_recurrent_kda (slot <= 0). The guard depends only on i_n,
+// so the early return is workgroup-uniform.
 //
 // Differences from gdn_decode_rdna2.cu (kept for reviewer orientation):
 //   * state ordering [k, v] (GDN: [V, K]);
@@ -64,6 +66,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include "glm5_kda_slot.cuh"
+
 namespace {
 
 constexpr int GLM5_KDA_D = 128;          // head dim (K == V == D)
@@ -78,9 +82,9 @@ constexpr float GLM5_KDA_QK_SCALE =
 // v_local = lane >> 3, ks = lane & 7 inside each 32-lane wave (4 v-groups
 // per wave), so xor masks 1/2/4 stay inside the group.
 __device__ __forceinline__ float glm5_kda_ksum(float x) {
-  x += __shfl_xor_sync(0xffffffffu, x, 1);
-  x += __shfl_xor_sync(0xffffffffu, x, 2);
-  x += __shfl_xor_sync(0xffffffffu, x, 4);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 1);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 2);
+  x += __shfl_xor_sync(0xffffffffffffffffULL, x, 4);
   return x;
 }
 
@@ -113,7 +117,7 @@ __global__ void glm5_kda_decode_rdna2_kernel(
 
   // NULL-slot guard: zero this head's outputs, leave both states alone.
   const long slot = (long)state_indices[i_n * stride_indices_seq];
-  if (slot < 0 || slot >= num_slots) {
+  if (glm5_kda_slot_is_empty(slot, num_slots)) {
     if (tid < GLM5_KDA_D) {
       out[(long)i_n * H * GLM5_KDA_D + (long)i_h * GLM5_KDA_D + tid] =
           __float2half(0.0f);
@@ -241,11 +245,11 @@ __global__ void glm5_kda_decode_rdna2_kernel(
   if (tid < GLM5_KDA_D) {
     const float val = s_o[tid];
     float sumsq = val * val;
-    sumsq += __shfl_xor_sync(0xffffffffu, sumsq, 1);
-    sumsq += __shfl_xor_sync(0xffffffffu, sumsq, 2);
-    sumsq += __shfl_xor_sync(0xffffffffu, sumsq, 4);
-    sumsq += __shfl_xor_sync(0xffffffffu, sumsq, 8);
-    sumsq += __shfl_xor_sync(0xffffffffu, sumsq, 16);
+    sumsq += __shfl_xor_sync(0xffffffffffffffffULL, sumsq, 1);
+    sumsq += __shfl_xor_sync(0xffffffffffffffffULL, sumsq, 2);
+    sumsq += __shfl_xor_sync(0xffffffffffffffffULL, sumsq, 4);
+    sumsq += __shfl_xor_sync(0xffffffffffffffffULL, sumsq, 8);
+    sumsq += __shfl_xor_sync(0xffffffffffffffffULL, sumsq, 16);
     if ((tid & 31) == 0) s_red[tid >> 5] = sumsq;
   }
   __syncthreads();

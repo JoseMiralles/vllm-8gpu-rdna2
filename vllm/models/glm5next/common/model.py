@@ -86,6 +86,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
 from .attention import Glm5NextMLAAttention
+from .dense_leftovers import require_glm5_dense_leftover
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
     Glm5NextMultiModalProcessor,
@@ -179,6 +180,12 @@ class Glm5NextMoE(nn.Module):
             )
 
         self.router_dtype = _get_moe_router_dtype(config)
+        require_glm5_dense_leftover(
+            quant_config,
+            f"{prefix}.gate",
+            "MoE router",
+            "GateLinear",
+        )
         self.gate = GateLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -212,9 +219,26 @@ class Glm5NextMoE(nn.Module):
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
-            # Shared experts stay dense on RDNA. The AWQ checkpoint leaves
-            # them in bf16, and a W4A16 kernel would cast those activations.
-            shared_quant = None if on_rdna_family() else quant_config
+            # Public W4A16 checkpoints leave shared experts dense (BF16).
+            # On RDNA, do not send them through the W4A16 kernel: if the
+            # checkpoint quantized them, fail instead of building a dense
+            # linear over packed weights.
+            if on_rdna_family():
+                require_glm5_dense_leftover(
+                    quant_config,
+                    f"{prefix}.shared_experts.gate_up_proj",
+                    "shared expert",
+                    "MergedColumnParallelLinear",
+                )
+                require_glm5_dense_leftover(
+                    quant_config,
+                    f"{prefix}.shared_experts.down_proj",
+                    "shared expert",
+                    "RowParallelLinear",
+                )
+                shared_quant = None
+            else:
+                shared_quant = quant_config
             self.shared_experts = Glm5NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -658,6 +682,12 @@ class Glm5NextModel(nn.Module):
             topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
+            require_glm5_dense_leftover(
+                vllm_config.quant_config,
+                f"{prefix}.embed_tokens",
+                "embedding",
+                "VocabParallelEmbedding",
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -949,13 +979,25 @@ class Glm5NextForCausalLM(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
-            # lm_head stays dense on RDNA so a bf16 head is not cast to fp16.
-            lm_quant = None if on_rdna_family() else quant_config
+            # lm_head is dense in the public W4A16 checkpoint. On RDNA,
+            # fail if a checkpoint quantized it instead of dropping the
+            # quant config and mis-loading packed weights as bf16.
+            lm_prefix = maybe_prefix(prefix, "lm_head")
+            if on_rdna_family():
+                require_glm5_dense_leftover(
+                    quant_config,
+                    lm_prefix,
+                    "lm_head",
+                    "ParallelLMHead",
+                )
+                lm_quant = None
+            else:
+                lm_quant = quant_config
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
                 self.config.hidden_size,
                 quant_config=lm_quant,
-                prefix=maybe_prefix(prefix, "lm_head"),
+                prefix=lm_prefix,
             )
         else:
             self.lm_head = PPMissingLayer()

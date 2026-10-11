@@ -166,10 +166,10 @@ __global__ void glm5_kda_prefill_solve_wy_rdna2_kernel(
       const int kk = tid & 15;  // reduction lane
       const float a_k = -s_A[grow * GLM5_WY_BT + base + kk];
       float partial = a_k * s_Ai[(base + kk) * GLM5_WY_BT + base + j];
-      partial += __shfl_xor_sync(0xffffffffu, partial, 1);
-      partial += __shfl_xor_sync(0xffffffffu, partial, 2);
-      partial += __shfl_xor_sync(0xffffffffu, partial, 4);
-      partial += __shfl_xor_sync(0xffffffffu, partial, 8);
+      partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, 1);
+      partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, 2);
+      partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, 4);
+      partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, 8);
       if (kk == 0) {
         const float a_j = -s_A[grow * GLM5_WY_BT + base + j];
         s_Ai[grow * GLM5_WY_BT + base + j] = a_j + partial;

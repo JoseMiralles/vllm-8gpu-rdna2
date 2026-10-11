@@ -85,7 +85,10 @@ def test_glm5next_kernels_match_gfx1030_contract():
         assert "v_wmma" not in code
         assert "v_mfma" not in code
         assert "v_dot2_f32_bf16" not in code
-        assert "0xffffffffffffffff" not in code
+        assert "0xffffffffu" not in code
+        if "__shfl_xor_sync" in code:
+            assert "0xffffffffffffffffULL" in code
+            assert "__shfl_xor(" not in code
         for launch in re.findall(r"<<<[^;]*?>>>", code):
             assert "stream" in launch, path.name
         rel = path.relative_to(REPO).as_posix()
@@ -104,3 +107,151 @@ def test_awq_moe_zeros_apply_gptqv1_offset():
     for nibble in range(8):
         expected |= nibble << (4 * nibble)
     assert int(packed.reshape(-1)[0].item()) == expected
+
+
+def test_kda_slot_rule_matches_null_and_pad():
+    """Slot 0 is NULL_BLOCK_ID and -1 is PAD_SLOT_ID. Both stay empty."""
+    from vllm.models.glm5next.amd.rdna.ops import glm5_kda_slot_is_empty
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+    assert NULL_BLOCK_ID == 0
+    assert PAD_SLOT_ID == -1
+    num_slots = 4
+    assert glm5_kda_slot_is_empty(0, num_slots) is True
+    assert glm5_kda_slot_is_empty(PAD_SLOT_ID, num_slots) is True
+    assert glm5_kda_slot_is_empty(1, num_slots) is False
+    assert glm5_kda_slot_is_empty(num_slots, num_slots) is True
+
+    recurrent = _code(KERNEL_DIR / "glm5_kda_recurrent_rdna2.cu")
+    decode = _code(KERNEL_DIR / "glm5_kda_decode_rdna2.cu")
+    for code in (recurrent, decode):
+        assert "glm5_kda_slot_is_empty" in code
+        assert "slot < 0" not in code
+        assert "slot <= 0" not in code
+    header = (KERNEL_DIR / "glm5_kda_slot.cuh").read_text()
+    assert "slot <= 0" in header
+
+
+def test_kda_hip_decode_is_opt_in(monkeypatch: pytest.MonkeyPatch):
+    from vllm.models.glm5next.common import kda
+
+    monkeypatch.delenv("VLLM_GLM5_KDA_HIP", raising=False)
+    assert kda._glm5_kda_hip_enabled() is False
+    monkeypatch.setenv("VLLM_GLM5_KDA_HIP", "0")
+    assert kda._glm5_kda_hip_enabled() is False
+    monkeypatch.setenv("VLLM_GLM5_KDA_HIP", "1")
+    assert kda._glm5_kda_hip_enabled() is True
+
+
+def test_rdna2_swiglu_limit_matches_shared_expert_clamp():
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_w4a16_moe import (
+        _swiglu_split,
+    )
+
+    limit = 10.0
+    x = torch.tensor([[12.0, -3.0, 11.0, -12.0, 1.0, 4.0]], dtype=torch.float32)
+    got = _swiglu_split(x, limit)
+    gate, up = x.chunk(2, dim=-1)
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    expected = torch.nn.functional.silu(gate) * up
+    torch.testing.assert_close(got, expected)
+    unclamped = _swiglu_split(x, None)
+    assert not torch.equal(got, unclamped)
+
+
+_W4 = {
+    "format": "pack-quantized",
+    "weights": {"num_bits": 4, "group_size": 128},
+}
+
+
+class _CtConfig:
+    def __init__(self, ignore, targets):
+        self.ignore = ignore
+        self.target_scheme_map = {target: dict(_W4) for target in targets}
+        self.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+
+class _AwqConfig:
+    def __init__(self, skipped, lm_head=False):
+        self.modules_to_not_convert = skipped
+        self.lm_head_quantized = lm_head
+        self.packed_modules_mapping = {}
+
+
+def test_dense_leftovers_follow_the_w4a16_checkpoint():
+    """wtdcode/GLM-5.3-Flash-AWQ-W4A16 ignores these and quantizes experts."""
+    from vllm.models.glm5next.common.dense_leftovers import (
+        glm5_leftover_is_quantized,
+        require_glm5_dense_leftover,
+    )
+
+    ignore = [
+        "lm_head",
+        "re:.*embed_tokens.*",
+        "re:.*visual\\..*",
+        "re:.*self_attn\\..*",
+        "re:.*shared_experts.*",
+        "re:.*mlp\\.gate$",
+        "re:.*layers\\.(0|1|2)\\.mlp\\..*",
+        "re:.*layers\\.45\\..*",
+    ]
+    cfg = _CtConfig(ignore, ["Linear"])
+    dense = [
+        (
+            "model.layers.4.mlp.shared_experts.gate_up_proj",
+            "MergedColumnParallelLinear",
+        ),
+        ("model.layers.4.mlp.shared_experts.down_proj", "RowParallelLinear"),
+        ("model.layers.4.mlp.gate", "GateLinear"),
+        ("lm_head", "ParallelLMHead"),
+        ("language_model.lm_head", "ParallelLMHead"),
+        ("model.embed_tokens", "VocabParallelEmbedding"),
+        ("model.layers.0.self_attn.in_proj_qkvbfg_a", "MergedColumnParallelLinear"),
+        ("model.layers.3.self_attn.indexer.wq_b", "ReplicatedLinear"),
+        (
+            "model.layers.3.self_attn.indexer.wk_weights_proj",
+            "MergedColumnParallelLinear",
+        ),
+    ]
+    for prefix, cls_name in dense:
+        assert glm5_leftover_is_quantized(cfg, prefix, cls_name) is False
+        require_glm5_dense_leftover(cfg, prefix, "leftover", cls_name)
+
+    # Routed experts are the quantized target and are not leftovers.
+    expert = "model.layers.4.mlp.experts.0.gate_proj"
+    assert glm5_leftover_is_quantized(cfg, expert, "ReplicatedLinear") is True
+
+    quantized = _CtConfig(["re:.*visual\\..*"], ["Linear"])
+    with pytest.raises(ValueError, match="shared expert"):
+        require_glm5_dense_leftover(
+            quantized,
+            "model.layers.4.mlp.shared_experts.down_proj",
+            "shared expert",
+            "RowParallelLinear",
+        )
+
+    awq_dense = _AwqConfig(
+        ["shared_experts", "lm_head", "embed_tokens", "self_attn", "gate"]
+    )
+    assert (
+        glm5_leftover_is_quantized(
+            awq_dense,
+            "model.layers.4.mlp.shared_experts.gate_up_proj",
+            "MergedColumnParallelLinear",
+        )
+        is False
+    )
+    awq_q = _AwqConfig(["lm_head"], lm_head=False)
+    assert (
+        glm5_leftover_is_quantized(
+            awq_q,
+            "model.layers.4.mlp.shared_experts.down_proj",
+            "RowParallelLinear",
+        )
+        is True
+    )
+    awq_head = _AwqConfig([], lm_head=True)
+    assert glm5_leftover_is_quantized(awq_head, "lm_head", "ParallelLMHead") is True
+    assert glm5_leftover_is_quantized(awq_dense, "lm_head", "ParallelLMHead") is False
