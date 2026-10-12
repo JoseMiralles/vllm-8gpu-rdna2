@@ -184,8 +184,10 @@ __global__ void glm5_kda_recurrent_rdna2_kernel(
   }
 }
 
-torch::Tensor squeeze_leading(const torch::Tensor& t) {
-  if (t.dim() == 4) {
+// The decode path hands over [1, T, H, D] activations and [1, T, H] beta
+// (fused_recurrent_kda's layout); the kernel indexes [T, H, D] and [T, H].
+torch::Tensor squeeze_leading(const torch::Tensor& t, int64_t rank) {
+  if (t.dim() == rank + 1) {
     TORCH_CHECK(t.size(0) == 1, "leading dimension must be 1, got ", t.size(0));
     return t.squeeze(0);
   }
@@ -222,12 +224,12 @@ void glm5_kda_recurrent_rdna2(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                               torch::Tensor state_indices,
                               torch::Tensor ssm_state, torch::Tensor out,
                               double lower_bound) {
-  q = squeeze_leading(q);
-  k = squeeze_leading(k);
-  v = squeeze_leading(v);
-  g = squeeze_leading(g);
-  beta = squeeze_leading(beta);
-  out = squeeze_leading(out);
+  q = squeeze_leading(q, 3);
+  k = squeeze_leading(k, 3);
+  v = squeeze_leading(v, 3);
+  g = squeeze_leading(g, 3);
+  beta = squeeze_leading(beta, 2);
+  out = squeeze_leading(out, 3);
 
   const auto dt = q.scalar_type();
   TORCH_CHECK(dt == at::kHalf || dt == at::kBFloat16,

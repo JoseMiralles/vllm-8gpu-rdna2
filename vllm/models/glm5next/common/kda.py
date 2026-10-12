@@ -443,8 +443,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     ) -> bool:
         """Plain-decode recurrence on RDNA when the HIP op is built.
 
-        Activations stay in their dtype. bf16 is widened inside the kernel.
-        Returns False when the Triton kernel should run instead.
+        Activations stay in their dtype and layout: the kernel reads q/k/v
+        and beta through their token and head strides, so the column slices
+        of the merged conv output are passed without a copy. bf16 is widened
+        inside the kernel. Returns False when the Triton kernel should run
+        instead.
 
         Args:
             q: Post-conv query, ``[1, T, H, 128]``.
@@ -459,6 +462,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         Returns:
             True when the HIP kernel wrote ``out`` and ``recurrent_state``.
+
         """
         if (
             not _glm5_kda_hip_enabled()
@@ -471,17 +475,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             or recurrent_state.stride(-1) != 1
             or recurrent_state.stride(-2) != self.head_dim
             or out.stride(-1) != 1
+            or any(t.stride(-1) != 1 for t in (q, k, v, g, beta))
         ):
             return False
         tokens = q.shape[1]
         glm5_kda_recurrent(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            g.contiguous(),
-            beta.contiguous(),
-            self.A_log.reshape(-1),
-            self.dt_bias.reshape(-1),
+            q,
+            k,
+            v,
+            g,
+            beta,
+            self.A_log,
+            self.dt_bias,
             state_indices[:tokens],
             recurrent_state,
             out,
