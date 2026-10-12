@@ -51,7 +51,9 @@
 //   s_bA aliases s_q's 16 KB slot after dot1/dot2 are done.
 //
 // Varlen-only chain: cu_seqlens [N+1], chunk_offsets [N+1] required.
-// No __launch_bounds__ / occupancy pins (project rule).
+// __launch_bounds__(GLM5_O_THREADS) states the real workgroup size; the
+// default 1024-thread assumption capped the kernel at 128 VGPRs with 160
+// spills (benchmarks/kernels/glm5next_rdna/isa_check.py). No waves_per_eu pin.
 //
 // PERF NOTE (first cut): dot1 costs ~2048 accurate expf per thread plus
 // ~512 for dot2's row gates. A chunk-16 variant (FlashKDA-inspired) or a
@@ -95,7 +97,7 @@ __device__ __forceinline__ float glm5_fdot2(__half2 a, __half2 b,
   return __builtin_amdgcn_fdot2(a, b, acc, /*clamp=*/false);
 }
 
-__global__ void glm5_kda_prefill_o_rdna2_kernel(
+__global__ __launch_bounds__(GLM5_O_THREADS) void glm5_kda_prefill_o_rdna2_kernel(
     const __half* __restrict__ q,        // [L, H, D] fp16
     const __half* __restrict__ k,        // [L, H, D] fp16
     const __half* __restrict__ v_new,    // [L, H, D] fp16 (ungated)

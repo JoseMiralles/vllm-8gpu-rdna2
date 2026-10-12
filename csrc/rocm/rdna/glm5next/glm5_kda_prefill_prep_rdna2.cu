@@ -61,7 +61,8 @@ constexpr int GLM5_PREP_HALO = 3;       // conv taps before chunk start
 constexpr int GLM5_PREP_THREADS = 128;  // 4 warps (wave32)
 constexpr float GLM5_PREP_L2NORM_EPS = 1e-6f;  // fixed FLA l2norm eps
 
-__global__ void glm5_kda_prefill_prep_rdna2_kernel(
+__global__ __launch_bounds__(GLM5_PREP_THREADS) void
+glm5_kda_prefill_prep_rdna2_kernel(
     const __half* __restrict__ mixed_qkv,    // [L, 3*H*D] pre-conv q|k|v
     const __half* __restrict__ conv_w,       // [3*H*D, 4]
     const float* __restrict__ A_log,         // [H]
