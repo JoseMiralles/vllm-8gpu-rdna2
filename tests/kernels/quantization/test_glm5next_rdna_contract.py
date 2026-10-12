@@ -13,12 +13,12 @@ from pathlib import Path
 import pytest
 import torch
 
-pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
-
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     _awq_uint8_qzeros_to_rdna2,
 )
 from vllm.platforms.interface import DeviceCapability
+
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 REPO = Path(__file__).resolve().parents[3]
 KERNEL_DIR = REPO / "csrc" / "rocm" / "rdna" / "glm5next"
@@ -265,3 +265,48 @@ def test_dense_leftovers_follow_the_w4a16_checkpoint():
     awq_head = _AwqConfig([], lm_head=True)
     assert glm5_leftover_is_quantized(awq_head, "lm_head", "ParallelLMHead") is True
     assert glm5_leftover_is_quantized(awq_dense, "lm_head", "ParallelLMHead") is False
+
+
+def test_sparse_mla_metadata_skips_aiter_for_rope_free_non_fp8_models():
+    """GLM-5.3-Flash (NoPE latent, non-fp8 KV) never reaches the AITER decode,
+    so the builder must not import aiter for it; DeepSeek-V3.2 shapes still do.
+    """
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+        _use_rocm_sparse_triton,
+        sparse_mla_needs_aiter_metadata,
+    )
+
+    assert sparse_mla_needs_aiter_metadata("auto", 512, 0) is False
+    assert sparse_mla_needs_aiter_metadata("float16", 512, 0) is False
+    assert sparse_mla_needs_aiter_metadata("fp8", 512, 0) is True
+    assert sparse_mla_needs_aiter_metadata("auto", 512, 64) is True
+    for kv_dtype, rope in (("auto", 0), ("fp8", 0), ("auto", 64), ("fp8_e4m3", 64)):
+        triton = _use_rocm_sparse_triton(
+            kv_cache_dtype=kv_dtype,
+            head_size=512 + rope,
+            kv_lora_rank=512,
+            num_prefills=1,
+            num_decodes=0,
+            num_decode_tokens=0,
+            max_query_len=1,
+        )
+        assert triton is (not sparse_mla_needs_aiter_metadata(kv_dtype, 512, rope))
+
+
+def test_kpool_indexer_hip_path_opens_on_rdna_without_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The AMD indexer module itself registers a CustomOp and cannot be
+    imported next to the NVIDIA one, so the gate lives in ``rdna.ops``.
+    """
+    import vllm.platforms.rdna as rdna
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.models.glm5next.amd.rdna.ops import hip_sparse_indexer_available
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", classmethod(lambda cls: False))
+    monkeypatch.setattr(rdna, "_ON_RDNA_FAMILY", True)
+    assert hip_sparse_indexer_available() is True
+    monkeypatch.setattr(rdna, "_ON_RDNA_FAMILY", False)
+    assert hip_sparse_indexer_available() is False
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", classmethod(lambda cls: True))
+    assert hip_sparse_indexer_available() is True
