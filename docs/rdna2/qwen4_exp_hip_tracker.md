@@ -31,6 +31,13 @@ whenever a kernel moves between stages.
 
 ## S3 serving A/B — the gates measured end to end (2026-10-13)
 
+> **RETRACTION (see "Round 5" below): every decode delta in this section is an
+> artefact of measurement order.** The gates-off arm reads TPOT 12.09 ms when
+> measured first and 11.40 ms when measured fourth in the same session. Against
+> that control there is no demonstrable decode win. Only the prefill numbers in
+> this section are trustworthy, and the decode rows should be read as "no
+> measurable effect". The historical "+9.7 % decode" claim is withdrawn.
+
 `tools/rdna2/bench_serve_gates_ab.sh`, production server
 (`tools/rdna2/serve_v620_stable.sh`, TP4/EP4 + MTP2, Uncensored W4A16, KV=4026531840),
 one fresh server process per arm (both gates are read at import time), same
@@ -124,8 +131,8 @@ channel), not in the kernels.
 | QSA only | 1723.3 (-0.7 %) | 1799.7 (-0.6 %) | 11.28 (**-6.7 %**) |
 | both | 1703.2 (-1.9 %) | 1783.7 (-1.5 %) | 11.58 (-4.2 %) |
 
-So both gates cost a little prefill (QSA ~0.6 %, GDN ~0.9 %) and QSA buys
-decode. The off arm is stable to +/-0.4 % over six sessions, so these are real.
+So both gates cost a little prefill (QSA ~0.6 %, GDN ~0.9 %). The decode
+column in this table is order-biased and is superseded by Round 5. The off arm is stable to +/-0.4 % over six sessions, so these are real.
 
 **The unexplained part is that every offline kernel is now *faster* than
 Triton at production shapes while the server is slower.** Measured offline at
