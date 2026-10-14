@@ -470,6 +470,45 @@ third run in a session, which is the same size as every effect being chased here
 Every gate comparison in this tracker that ran off-first-then-on is therefore
 suspect unless it was an A/B/A. The both-gates one was; the QSA one was not.
 
+#### Round 15 — GDN A/B/A: the residual was the noise floor
+
+All three arms health 200, within-session:
+
+| arm | prefill 8k tok/s | prefill 16k tok/s |
+|---|---:|---:|
+| off (1st) | 1705.9 | 1801.7 |
+| GDN only (2nd) | **1716.3** | 1792.4 |
+| off (3rd) | 1720.8 | 1800.0 |
+
+At 8k GDN-only is *faster* than the first off arm; at 16k it is 0.5 % below the
+off mean. Crucially the off arm drifted **+0.9 %** here and **-0.8 %** in the
+round-14 QSA run — opposite directions. So the between-arm spread is **±1 % and
+is not a systematic ordering effect: it is this setup's noise floor.**
+
+**Therefore every gate effect measured end-to-end in this tracker (0.5-1.6 %) is
+at or below the noise floor, and the "gates cost ~1 % prefill" conclusion is
+withdrawn along with the QSA one.** What the measurements actually support:
+
+| level | HIP vs Triton |
+|---|---|
+| GDN kernels, offline at T=2048 | **-23.9 %** (faster) |
+| GDN whole chain, offline + host cost | **-5.6 %** |
+| GDN whole chain, in-server per-op probe | **-10.8 %** (+0.5 % of prefill) |
+| QSA ops at prefill row counts | store -25/-58 %, compress +9/+15 %, dense mqa -10 % |
+| end-to-end prefill, A/B/A | parity within +/-1 % noise |
+| end-to-end decode | parity within +/-1 % noise |
+
+So the opt-in HIP paths are **faster at every level that can be measured
+precisely, and indistinguishable end-to-end because the end-to-end measurement
+cannot resolve ~0.5 %.** There is no clean end-to-end win to flip a default on,
+which is exactly the condition PR #64 sets for S6 — so the defaults correctly
+stay "0".
+
+**Lesson for anyone continuing:** this box's prefill throughput has a ~±1 %
+between-arm spread that is not ordering, so any single off-then-on comparison
+here — including several earlier in this tracker — cannot resolve the effects
+being discussed. Use A/B/A and treat anything under ~1 % as unresolved.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
