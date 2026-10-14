@@ -498,9 +498,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                 &qsa_compress_groups_rdna2);
 
   rocm_ops.def(
-      "qsa_mqa_paged_rdna2(Tensor q_fp16, Tensor kv_cache, Tensor weights, "
-      "Tensor context_lens, Tensor block_tables, Tensor max_model_len) "
-      "-> Tensor");
+      "qsa_mqa_paged_rdna2(Tensor q, Tensor k_cache, Tensor page_table, "
+      "Tensor token_to_req, Tensor query_positions, Tensor sequence_lengths, "
+      "int compress_ratio, int num_columns, float score_scale) "
+      "-> (Tensor, Tensor)");
   rocm_ops.impl("qsa_mqa_paged_rdna2", torch::kCUDA, &qsa_mqa_paged_rdna2);
 
   // Qwen4Exp PLE dilated short-conv HIP (opt-in: VLLM_RDNA_PLE_CONV_HIP=1).

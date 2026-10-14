@@ -793,20 +793,26 @@ def qsa_compress_groups_rdna2(
 
 
 def qsa_mqa_paged_rdna2(
-    q_fp16: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-) -> torch.Tensor:
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+    num_columns: int,
+    score_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.ops._rocm_C.qsa_mqa_paged_rdna2(
-        q_fp16,
-        kv_cache,
-        weights,
-        context_lens,
-        block_tables,
-        torch.tensor(max_model_len, dtype=torch.int64),
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns,
+        score_scale,
     )
 
 

@@ -7,9 +7,8 @@ Opt-in replacement for the QSA decode Triton kernels in
 
 - ``qsa_store_cache_rows_rdna2`` mirrors ``_store_qsa_rows_kernel``.
 - ``qsa_compress_groups_rdna2`` mirrors ``_compress_qsa_groups_kernel``.
-- ``qsa_mqa_paged_rdna2`` reuses the existing
-  ``paged_mqa_logits_decode_rdna2`` indexer kernel when the shape
-  contract matches (single Q head, single KV head, paged).
+- ``qsa_mqa_paged_rdna2`` mirrors ``_qsa_mqa_paged_kernel`` (fp16, arbitrary
+  head count, request-indirected page table, ``compress_ratio`` visibility).
 
 The sparse splitk attention (``_qsa_sparse_paged_gqa_splitk_kernel`` and
 ``_qsa_merge_splitk_kernel``) is left to the Triton path for now; it
@@ -34,9 +33,17 @@ logger = init_logger(__name__)
 _DEBUG = _os.environ.get("VLLM_QSA_RDNA2_DEBUG", "0") == "1"
 
 
-def qsa_use_rdna2() -> bool:
-    """True iff the HIP QSA decode path is enabled for this process."""
-    return bool(VLLM_RDNA_QSA_HIP) and on_gfx10x()
+def qsa_use_rdna2(dtype: torch.dtype | None = None) -> bool:
+    """True iff the HIP QSA decode path is enabled for this process.
+
+    The HIP kernels implement fp16 only; ``dtype`` (when given) additionally
+    gates on the caller's tensor dtype so a bf16 model keeps the Triton path.
+    """
+    return (
+        bool(VLLM_RDNA_QSA_HIP)
+        and on_gfx10x()
+        and (dtype is None or dtype == torch.float16)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -104,20 +111,30 @@ def qsa_compress_groups(
 
 def qsa_mqa_paged(
     q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-) -> torch.Tensor:
-    """MQA paged indexer logits (single Q head, single KV head).
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+    num_columns: int,
+    score_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MQA paged indexer logits (mirrors the Triton ``qsa_mqa_paged``).
 
-    Returns a logits tensor of shape ``[num_rows, max_kv_per_request]``.
-    Wraps the existing ``paged_mqa_logits_decode_rdna2`` indexer kernel
-    when the shape contract matches.
+    Returns ``(logits [rows, num_columns] fp32, visible_blocks [rows] int32)``;
+    ``logits`` is ``-inf`` outside each row's visible compressed-column range.
     """
     return ops.qsa_mqa_paged_rdna2(
-        q, kv_cache, weights, context_lens, block_tables, max_model_len
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns,
+        float(score_scale),
     )
 
 

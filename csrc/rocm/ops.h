@@ -685,13 +685,16 @@ void qsa_compress_groups_rdna2(
     const at::Tensor& head_dim,
     bool load_rope_positions);
 
-torch::Tensor qsa_mqa_paged_rdna2(
-    torch::Tensor q_fp16,
-    torch::Tensor kv_cache,
-    torch::Tensor weights,
-    torch::Tensor context_lens,
-    torch::Tensor block_tables,
-    const at::Tensor& max_model_len);
+std::tuple<torch::Tensor, torch::Tensor> qsa_mqa_paged_rdna2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t compress_ratio,
+    int64_t num_columns,
+    double score_scale);
 
 // ---------------------------------------------------------------------------
 // PLE dilated short-conv HIP kernels for Qwen4Exp / Qwen3.8-Flash-Next on

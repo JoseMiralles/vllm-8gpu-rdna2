@@ -675,6 +675,19 @@ def qsa_mqa_paged(
     columns = capacity if num_columns is None else num_columns
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
+
+    if qsa_rdna2.qsa_use_rdna2(q.dtype):
+        return qsa_rdna2.qsa_mqa_paged(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            columns,
+            float(score_divisor),
+        )
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
@@ -1085,7 +1098,7 @@ def qsa_compress_groups_with_ratio(
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
-    if qsa_rdna2.qsa_use_rdna2():
+    if qsa_rdna2.qsa_use_rdna2(raw_keys.dtype):
         return qsa_rdna2.qsa_compress_groups_with_ratio_compat(
             raw_keys,
             raw_positions,
