@@ -1130,13 +1130,19 @@ max_value + log2(max(normalizer, 1e-20))` (`-inf` when the row has no values).
 `denom = sum(w)`, `merged = sum(partial_output * w[:, None]) / denom` (0 where
 `denom <= 0`), store to `output[row, head, :]`.
 
-**Do not start from scratch — reuse `csrc/rocm/fa_rdna2.cu`.** It already
-implements paged + GQA + split-k + varlen prefill attention on RDNA2 with this
-fork's idioms (`V_DOT2`, LDS staging, padded strides to dodge the 32-bank
-conflict — see the bank-conflict lesson above). The QSA difference is that K/V are
-gathered by an index list rather than a contiguous causal range, and there is no
-causal mask (the selection already encodes it). Copying its split/merge skeleton
-and swapping the gather is far less work than a fresh flash-attention kernel.
+**Start from `csrc/rocm/fa_rdna2.cu`, but budget for it being an adaptation,
+not a copy.** That file already does paged + GQA + split-k + varlen prefill
+attention on RDNA2 with this fork's idioms (`V_DOT2`, LDS staging, padded strides
+to dodge the 32-bank conflict — see the bank-conflict lesson above), and its
+reduce kernel (`fa_prefill_paged_varlen_splitk_reduce_kernel_256`, ~70 lines) is a
+close match for the QSA merge. The splitk kernels are **not** directly reusable:
+`fa_prefill_paged_varlen_splitk_kernel_256` blocks `BR_PREFILL` query rows across
+a sequence and walks a causal (optionally sliding-window) KV range with
+`fa_clip_kv_walk`, whereas QSA blocks the **GQA group at a single row** and
+traverses an **explicit index list**. So the query blocking, the KV traversal and
+the split partitioning all differ; carry over the softmax/split/partial layout and
+the RDNA2 idioms, and rewrite the traversal. Budget this as a real kernel, not an
+edit.
 
 ### To implement
 
