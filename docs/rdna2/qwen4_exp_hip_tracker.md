@@ -222,6 +222,25 @@ to decide whether a sub-1 % prefill cost with no decode benefit justifies the
 path at all, or to find the remaining cost with in-server profiling (which
 `rocprofv3 --attach` cannot do here — see the gotcha below).
 
+### Operational gotchas (learned the hard way)
+
+- **`pkill -f '^VLLM::'` does not kill orphaned vLLM workers.** After a server is
+  killed its four `VLLM::Worker_TPn_EPn` processes can be orphaned (parent gone)
+  and survive, holding ~24.5 GB per GPU — 98 GB across four GPUs was observed.
+  The next server then dies at init with "Engine core initialization failed" and
+  *no* memory error in the log, which reads exactly like a code regression and is
+  not one. Anchored `pgrep` does match them, so use
+  `for p in $(pgrep -f '^VLLM::'); do kill -9 "$p"; done`.
+- **Wait for VRAM to actually free between arms.** ROCm's cleanup grace is ~15 s;
+  a 6 s settle is not enough and produces the failure above.
+- **Never `cp` over `vllm/_rocm_C.abi3.so` while a server has it mmapped** — it
+  truncates the inode and segfaults the server. Use
+  `cp ... .so.new && mv .so.new .so`.
+- **`--enforce-eager` aborts this model at load**; `--compilation-config.mode=0`
+  is the working way to disable the inductor graph.
+- **`vllm bench serve` shape matters**: 16 prompts of 8k and 8 of 16k is the
+  comparable shape; 12 prompts of 16k reads ~6 % lower (1700 vs 1806 tok/s).
+
 #### Round 8 — the residue is real (~1.2 %) but not attributable offline
 
 Pooling every 16k prefill reading taken on the fixed build, the gates-off arm
