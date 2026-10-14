@@ -54,6 +54,10 @@ constexpr int PREP_ELEMS_PER_LANE = 64;
 constexpr float PREP_SOFTPLUS_THRESHOLD = 20.0f;
 constexpr float PREP_L2NORM_EPS = 1e-6f;
 
+__device__ __forceinline__ uint4 gdn_ld_u4(const void* p) {
+  return *reinterpret_cast<const uint4*>(p);
+}
+
 __device__ __forceinline__ float gdn_to_f32(float x) { return x; }
 __device__ __forceinline__ float gdn_to_f32(__half x) {
   return __half2float(x);
@@ -157,15 +161,23 @@ __global__ void __launch_bounds__(PREP_THREADS)
     const long k_off_row = qkv_row + HK + (long)i_h * 128 + kv_k_start;
 
     // Load this lane's 64 q elements and 64 k elements (masked past t_chunk).
-    float q_local[PREP_ELEMS_PER_LANE];
-    float k_local[PREP_ELEMS_PER_LANE];
+    // The lane's elements are contiguous, so take them 8 halves at a time:
+    // the scalar form emitted 64 2-byte global loads per array (1048 in the
+    // whole kernel). The values stay fp16 -- they are stored as fp16 anyway --
+    // which halves the register cost of the two arrays.
+    __half q_local[PREP_ELEMS_PER_LANE];
+    __half k_local[PREP_ELEMS_PER_LANE];
+    if (kv_tok_valid) {
 #pragma unroll
-    for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-      q_local[j] = 0.0f;
-      k_local[j] = 0.0f;
-      if (kv_tok_valid) {
-        q_local[j] = __half2float(mixed_qkv[q_off_row + j]);
-        k_local[j] = __half2float(mixed_qkv[k_off_row + j]);
+      for (int j = 0; j < PREP_ELEMS_PER_LANE; j += 8) {
+        *reinterpret_cast<uint4*>(&q_local[j]) = gdn_ld_u4(&mixed_qkv[q_off_row + j]);
+        *reinterpret_cast<uint4*>(&k_local[j]) = gdn_ld_u4(&mixed_qkv[k_off_row + j]);
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
+        q_local[j] = __float2half(0.0f);
+        k_local[j] = __float2half(0.0f);
       }
     }
 
@@ -176,17 +188,22 @@ __global__ void __launch_bounds__(PREP_THREADS)
     float sk = 0.0f;
 #pragma unroll
     for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-      sq += q_local[j] * q_local[j];
-      sk += k_local[j] * k_local[j];
+      const float qf = __half2float(q_local[j]);
+      const float kf = __half2float(k_local[j]);
+      sq += qf * qf;
+      sk += kf * kf;
     }
     sq += __shfl_xor_sync(0xffffffffffffffffULL, sq, 1);
     sk += __shfl_xor_sync(0xffffffffffffffffULL, sk, 1);
-    const float q_inv = 1.0f / sqrtf(sq + PREP_L2NORM_EPS);
-    const float k_inv = 1.0f / sqrtf(sk + PREP_L2NORM_EPS);
+    // rsqrtf is the hardware reciprocal-square-root (one instruction) where
+    // 1.0f/sqrtf expanded to a ~12-instruction division sequence. The output
+    // is fp16, so the approximation is far inside its precision.
+    const float q_inv = rsqrtf(sq + PREP_L2NORM_EPS);
+    const float k_inv = rsqrtf(sk + PREP_L2NORM_EPS);
 #pragma unroll
     for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-      q_local[j] *= q_inv;
-      k_local[j] *= k_inv;
+      q_local[j] = __float2half(__half2float(q_local[j]) * q_inv);
+      k_local[j] = __float2half(__half2float(k_local[j]) * k_inv);
     }
 
     // Store q and k.
@@ -196,9 +213,11 @@ __global__ void __launch_bounds__(PREP_THREADS)
       const long k_out_row =
           kv_t_abs * stride_k_tok + (long)i_h * 128 + kv_k_start;
 #pragma unroll
-      for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-        q[q_out_row + j] = __float2half(q_local[j]);
-        k_out[k_out_row + j] = __float2half(k_local[j]);
+      for (int j = 0; j < PREP_ELEMS_PER_LANE; j += 8) {
+        *reinterpret_cast<uint4*>(&q[q_out_row + j]) =
+            *reinterpret_cast<const uint4*>(&q_local[j]);
+        *reinterpret_cast<uint4*>(&k_out[k_out_row + j]) =
+            *reinterpret_cast<const uint4*>(&k_local[j]);
       }
     }
   } else {
@@ -214,8 +233,9 @@ __global__ void __launch_bounds__(PREP_THREADS)
         kv_t_abs * stride_v_tok + (long)i_hv * 128 + kv_k_start;
     if (kv_tok_valid) {
 #pragma unroll
-      for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-        v[v_out_row + j] = mixed_qkv[v_in_row + j];
+      for (int j = 0; j < PREP_ELEMS_PER_LANE; j += 8) {
+        *reinterpret_cast<uint4*>(&v[v_out_row + j]) =
+            gdn_ld_u4(&mixed_qkv[v_in_row + j]);
       }
     }
 

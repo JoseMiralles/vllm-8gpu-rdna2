@@ -39,6 +39,9 @@ from vllm.third_party.flash_linear_attention.ops.wy_fast import recompute_w_u_fw
 from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
+from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (
+    fused_post_conv_prep,
+)
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 
 DEV = "cuda"
@@ -123,6 +126,44 @@ def chain_arms(d):
     return triton, hip
 
 
+def prep_arms(d, H=12, Hg=4, seed=11):
+    """fused_post_conv_prep + chunk_local_cumsum vs gdn_prefill_prep_rdna2."""
+    total = d["q"].shape[1]
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    mixed_qkv = torch.randn(
+        total, 2 * Hg * K + H * V, device=DEV, dtype=torch.float16, generator=gen
+    )
+    a = torch.randn(total, H, device=DEV, dtype=torch.float16, generator=gen)
+    b = torch.randn(total, H, device=DEV, dtype=torch.float16, generator=gen)
+    A_log = torch.randn(H, device=DEV, dtype=torch.float32, generator=gen)
+    dt_bias = torch.randn(H, device=DEV, dtype=torch.float32, generator=gen)
+    cu, ci = d["cu_seqlens"], d["chunk_indices"]
+    q_out = torch.empty(total, Hg, K, dtype=torch.float16, device=DEV)
+    k_out = torch.empty(total, Hg, K, dtype=torch.float16, device=DEV)
+    v_out = torch.empty(total, H, V, dtype=torch.float16, device=DEV)
+    g_out = torch.empty(total, H, dtype=torch.float32, device=DEV)
+    beta_out = torch.empty(total, H, dtype=torch.float32, device=DEV)
+
+    def ref():
+        q, k, v, g, beta = fused_post_conv_prep(
+            conv_output=mixed_qkv, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+            num_k_heads=Hg, head_k_dim=K, head_v_dim=V,
+            apply_l2norm=True, output_g_exp=False,
+        )
+        return chunk_local_cumsum(
+            g.unsqueeze(0), chunk_size=BT, reverse=False, cu_seqlens=cu,
+            chunk_indices=ci, head_first=False, output_dtype=torch.float32,
+        )
+
+    def hip():
+        return torch.ops._rocm_C.gdn_prefill_prep_rdna2(
+            mixed_qkv, a, b, A_log, dt_bias, q_out, k_out, v_out, g_out,
+            beta_out, cu, ci,
+        )
+
+    return {"prep": (ref, hip)}
+
+
 def kernel_arms(d):
     B, T, Hg, _ = d["q"].shape
     H, cu, ci, co = d["v"].shape[2], d["cu_seqlens"], d["chunk_indices"], d["chunk_offsets"]
@@ -198,7 +239,9 @@ def main():
         r, h = timeit(ref), timeit(hip)
         entry = {"chain": {"triton_us": r, "hip_us": h,
                            "delta_pct": (h - r) / r * 100}}
-        for name, (kr, kh) in kernel_arms(d).items():
+        arms = prep_arms(d)
+        arms.update(kernel_arms(d))
+        for name, (kr, kh) in arms.items():
             a, b = timeit(kr), timeit(kh)
             entry[name] = {"triton_us": a, "hip_us": b,
                            "delta_pct": (b - a) / a * 100}
