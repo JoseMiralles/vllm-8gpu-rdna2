@@ -1480,6 +1480,90 @@ proof that counter reductions here do not imply speed.
 
 Until the rewrite lands, `VLLM_RDNA_QSA_HIP=1` should stay off: previously it made
 the QSA path a wash (HIP indexer + Triton attention), and it is now a net loss.
+**SUPERSEDED — the rewrite landed on 2026-10-14; see the next section.**
+
+## The rewrite landed: the HIP sparse attention now beats Triton at head_dim 256 (2026-10-14)
+
+The "what is left" rewrite above (shared LDS-staged K/V, vectorised gather,
+unrolled `P @ V`) landed, together with an LDS-staged `partial_lse` and a 4-chain
+ILP merge kernel. **The section's verdict is superseded: `VLLM_RDNA_QSA_HIP=1` is
+no longer a regression.**
+
+It also turned out that every earlier measurement was taken at the wrong geometry.
+The model's main attention is **`head_dim = 256`** (partial_rotary_factor 0.25 over
+head_dim 256 -> rotary_dim 64, `mrope_section` [11,11,10]), not 128, so with the flag
+on the server died in warmup: `qsa_sparse_paged_attention_rdna2: head_dim must be
+<= 128`. Two defects in the rewrite:
+
+* the staged K/V tiles used one 128+8 LDS row stride. The kernel is now templated on
+  the stride and dispatches 136 (head_dim <= 128, ~20 KB LDS, 3 workgroups/CU) or 264
+  (head_dim <= 256, ~39 KB, 1 workgroup/CU). `BLOCK_N = 64` does not fit at 264 and is
+  not instantiated.
+* `ACC_DIMS` was hardcoded 4, so 32 lanes covered only dims [0,128) and dims
+  [128,256) were never written (48 % of the output). It is now derived from the LDS
+  stride, with an `if constexpr` 16-byte `uint4` read in `P @ V` for the 8-dim case.
+
+A third bug produced `NaN` on fully masked rows: clang contracts
+`col_score * scale_log2 - next_max` into an FMA, so the exact product minus the
+*rounded* max left a ~1e11 residue for the `-1e20` masked sentinel and `exp2` turned
+it into `inf` (`inf * 0` V = NaN). The scores are now scaled before the max reduction
+so the subtraction is exact, and the sentinel is `-INFINITY`.
+
+Measured at the production geometry (group_size 6, kv_heads 1, **head_dim 256**,
+topk 2048, page_size 1024), in-session vs Triton, `torch.profiler` kernel time:
+
+| rows | Triton | HIP | delta |
+|---:|---:|---:|---:|
+| 3 | 169.3 us | 120.9 us | -28.6 % |
+| 6 | 262.4 us | 200.4 us | -23.6 % |
+| 12 | 433.6 us | 364.5 us | -15.9 % |
+| 24 | 468.6 us | 436.7 us | -6.8 % |
+| 64 | 548.7 us | 510.8 us | -6.9 % |
+| 256 | 1772.9 us | 1200.5 us | -32.3 % |
+| 512 | 3424.4 us | 2339.7 us | -31.7 % |
+| 1024 | 4950.0 us | 4639.3 us | -6.3 % |
+| 2048 | 9708.6 us | 9298.3 us | -4.2 % |
+
+HIP is faster at all nine served shapes. `test_qsa_rdna2.py` parametrizes
+head_dim {128, 256} and is at 290 passed.
+
+### The rest of the gated path, measured the same way (2026-10-14)
+
+`tools/rdna2/bench_qsa_rdna2.py` now sweeps rows 3..2048 (in-session HIP vs Triton,
+`kernel_us`): `store_cache_rows`, `compress_groups` and `mqa_paged` are faster at
+every shape. **`expand_indices` is slower at every shape** (e.g. 63.5 -> 129.8 us at
+rows 1024, 76.4 -> 90.3 us at rows 2048) — it is a small integer compaction kernel and
+is the one gated op that still loses. `tools/rdna2/bench_gdn_prefill_chain_rdna2.py`
+adds the 1024/2048 served chunks: the GDN prefill chain is at parity, not faster
+(-2.6 % at 8k, +1.5 % at 2k, +21 % at 16k x2), with `prep`/`kkt`/`solve_wy`/`o` slower
+and `delta_h` faster.
+
+### M-RoPE and the metadata builder are Triton-free now
+
+Two more Triton sites were removed from the QSA path: `build_qsa_metadata` is routed
+to the pure-torch builder under the gate, and the 2-D (multimodal) M-RoPE now uses the
+existing gfx1030 HIP kernel (`mrope_forward_rdna2`) from both
+`MRotaryEmbedding.forward_hip` (the HIP branch previously sat in the unreachable
+`forward_cuda`) and `amd/indexer_qsa.py::apply_qsa_rope`.
+
+### The runtime audit (both flags, text + multimodal)
+
+With `VLLM_RDNA_QSA_HIP=1` **and** `VLLM_GDN_HIP_PREFILL=1`, the real server (every
+worker instrumented via a `PYTHONPATH` `sitecustomize.py` that logs every
+`JITFunction.run`) launches **zero Triton kernels whose innermost vLLM frame is in the
+QSA path, the GDN prefill chain, or `rotary_embedding`**. The multimodal request does
+reach the mm path (`_bilinear_pos_embed_kernel`, `_prepare_rope_positions_kernel`), so
+this is not a vacuous pass.
+
+The only Triton left in the GDN layer is `causal_conv1d` — and that is **recipe
+configuration, not a fallback**: `tools/rdna/recipes/*.env` set
+`VLLM_CAUSAL_CONV1D_RDNA2_{FWD,UPDATE}=0`. Those are a third pair of knobs, not the two
+flags under test. Independently, the HIP conv kernels only supported
+`conv_states.size(2) == width - 1`, which MTP=2 never satisfies; that is fixed (the
+host wrappers now use the effective `state_len = width - 1`, exactly as Triton does,
+and the guards accept extra capacity). Even with the knobs on, the MTP spec-decode
+update (`num_accepted_tokens` is not None) has no HIP implementation and stays Triton.
+`amd/ops/hc.py` (hyper-connection) is also Triton and is not gated by either flag.
 
 ## TunableOp: the whole grid re-measured, and the 256/512-token chunk family (2026-10-14)
 
