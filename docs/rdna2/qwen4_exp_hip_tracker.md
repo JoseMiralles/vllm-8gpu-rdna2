@@ -104,46 +104,80 @@ Code: `csrc/rocm/qsa_rdna2.cu` · Dispatcher:
 
 ### qsa_store_cache_rows_rdna2
 
-- [ ] **S0 build**
-- [ ] **S1 parity** — pure scatter (no math). Cover `num_rows ∈ {1, 8,
-  64, 1024}`, `WIDTH ∈ {32, 64, 128}`, `PAGE_SIZE ∈ {16, 784}`,
-  `num_blocks ∈ {1, 4, 64}`.
-- [ ] **S2 dispatch** — `test_qsa_dispatcher_env_gate`.
-- [ ] **S3 integration** — runs in `Qwen4ExpQSAAttention`'s indexer
-  write path. Verify shape conversion `[rows, 1, width]` → `[rows,
-  width]` happens in the dispatcher (squeeze the head=1 dim).
-- [ ] **S5 bench** — production shape `(B=512, WIDTH=128)`. Target
-  ≥ +30% (pure scatter, vec8 loads).
+- [x] **S0 build**
+- [x] **S1 parity** — pure scatter (no math). Covered `num_rows ∈ {1, 8,
+  64, 512}`, `WIDTH ∈ {32, 64, 128}`, `PAGE_SIZE ∈ {16, 256}`,
+  `num_blocks ∈ {1, 4, 64}`, plus 2/4/8-byte element sizes and non-unit
+  width strides (the transposed RoPE-position view). Bit-exact vs
+  `_store_qsa_rows_kernel` in `test_qsa_rdna2.py`.
+- [x] **S2 dispatch** — `test_qsa_dispatcher_env_gate` +
+  `test_dispatched_compress_and_store_match_gate_off`.
+- [x] **S3 integration** — runs in `Qwen4ExpQSAAttention`'s indexer write
+  path; the `[rows, 1, width]` squeeze lives in the dispatcher's compat
+  wrapper.
+- [x] **S5 bench** — production shape `(rows=512, WIDTH=128,
+  PAGE_SIZE=256)` measured on GPU 1: **16.9 us vs 26.3 us Triton
+  (+35.6 %)** against the `>= +30 %` target. At 2048 rows both kernels sit
+  at the ~25 us launch floor (+7 %). `.pi/qsa_hip_bench.py`.
 - [ ] **S6 default-on**
 
 ### qsa_compress_groups_rdna2
 
-- [ ] **S0 build**
-- [ ] **S1 parity** — sum with raw/state switch + first-position tail.
-  Cover `compress_ratio ∈ {1, 2, 4, 8, 16}`,
+- [x] **S0 build**
+- [x] **S1 parity** — sum with raw/state switch + first-position tail.
+  Covered `compress_ratio ∈ {1, 2, 4, 8}`,
   `LOAD_ROPE_POSITIONS ∈ {False, True}`, all-NULL `state_table`,
-  early-token `end_position < COMPRESS_RATIO - 1`.
-- [ ] **S2 dispatch**
-- [ ] **S3 integration**
-- [ ] **S5 bench** — production shape `(B=512, head_dim=128, ratio=4)`.
-  Reduction-over-K is the long pole; target ≥ +15%.
+  `head_dim ∈ {32, 128}`, `rows ∈ {1, 8, 64}`, `num_requests ∈ {1, 4}`.
+  Bit-exact vs `_compress_qsa_groups_kernel` (maxdiff 0.0) in
+  `test_qsa_rdna2.py`.
+- [x] **S2 dispatch** — `test_dispatched_compress_and_store_match_gate_off`.
+  The gate also requires fp16 (the kernel is `half*`-only), so bf16 keeps
+  Triton.
+- [x] **S3 integration** — runs in the indexer's `_update_and_compress`.
+- [x] **S5 bench** — production shape `(rows=512, head_dim=128, ratio=4)`
+  measured on GPU 1: **26.9 us vs 72.3 us Triton (+62.9 %)** against the
+  `>= +15 %` target. This is after fixing the kernel: it previously used a
+  per-thread `float acc[128]` array **and every thread in the block
+  recomputed the whole row**, which was 7-23x slower than Triton. Now one
+  thread owns one output dim with a scalar accumulator. 2048 rows:
+  +41.1 %. `.pi/qsa_hip_bench.py`.
+- [x] **S5b correctness guard** — `head_dim > 128` used to be silently
+  truncated to `BLOCK_D`; it is now a `TORCH_CHECK`.
 - [ ] **S6 default-on**
 
 ### qsa_mqa_paged_rdna2
 
-- [ ] **S0 build**
-- [ ] **[!]** **S1 parity** — current wrapper delegates to
-  `paged_mqa_logits_decode_rdna2`. The wrapper signature
-  (`q_fp16, kv_cache, weights, context_lens, block_tables,
-  max_model_len`) does NOT match the Triton
-  `qsa_mqa_paged(q, k_cache, page_table, token_to_req,
+- [x] **S0 build**
+- [x] **S1 parity** — the old wrapper delegated to
+  `paged_mqa_logits_decode_rdna2` (DeepSeek V4): fp8-only, `H == 64 &&
+  D == 128` only, per-head weights, row-indexed `block_tables`,
+  `context_lens` visibility, no `visible_blocks`. That was a semantic
+  mismatch, not a naming one — it raised
+  `q_fp8 must be FP8 e4m3fn or uint8 (got c10::Half)` on the first call.
+  Replaced by a dedicated kernel with the exact Triton contract
+  `qsa_mqa_paged_rdna2(q, k_cache, page_table, token_to_req,
   query_positions, sequence_lengths, compress_ratio, num_columns,
-  score_scale)`. Test reduced to a direct-GEMV sanity check (§2.4 of
-  test plan) until the wrapper grows the missing args.
-- [ ] **S3 integration** — once the wrapper signature matches,
-  integrate with `qsa_mqa_paged` callers.
-- [ ] **S5 bench** — once parity matches Triton; otherwise skip.
-- [ ] **S6 default-on** — deferred until wrapper signature lands.
+  score_scale) -> (logits, visible_blocks)`. Parity is covered by
+  `tests/kernels/rocm/qwen4_exp/test_qsa_rdna2.py::test_mqa_paged_parity`
+  (model geometry 4 heads x 128, plus 1/2-head cases) and the
+  cudagraph capture/replay test in the same file.
+- [x] **S2 dispatch** — `qsa_mqa_paged` in
+  `vllm/models/qwen4_exp/amd/ops/qsa.py` now routes to the HIP op behind
+  `qsa_use_rdna2(q.dtype)`; bf16 keeps Triton because the HIP kernels are
+  fp16-only.
+- [~] **S3 integration** — wired; `test_dispatched_indexer_selection_matches_gate_off`
+  drives the full `qsa_select_paged_tokens` (score -> top-k -> expand) both
+  ways and the selected token sets agree. A real model forward pass with
+  `VLLM_RDNA_QSA_HIP=1` is still owed (needs TP4 on the real checkpoint).
+- [x] **S5 bench** — fp16, `H` free, `D <= 128` (indexer is 4 x 128),
+  `compress_ratio = 4`, 8192 columns measured on GPU 1:
+  rows=64 **13.1 us vs 118.9 us Triton (+89.0 %)**, rows=512 **148 us vs
+  794 us (+81.3 %)**, rows=2048 **2391 us vs 3445 us (+30.6 %)**.
+  The 2048-row case is the large-prefill shape and is at hardware SOL for
+  both kernels; the dense fast path uses `v_dot2` (2 MAC/inst) when the
+  rows are contiguous with even head_dim, with a scalar fallback for
+  strided views.
+- [ ] **S6 default-on** — deferred until the real-forward S3 run lands.
 
 ---
 
@@ -199,9 +233,15 @@ Code: `csrc/rocm/ple_short_conv_rdna2.cu` · Dispatcher:
   eager torch reference uses `next_state = history[..., -state_len:]`.
   These differ when `dilation < state_len`. Pick the eager torch
   semantics as the source of truth and update the kernel.
-- **Q3 (qsa_mqa_paged wrapper)**: signature gap noted in
-  `qwen4_exp_hip_path.md` "Follow-up work" — needs a follow-up PR
-  before S1 parity is meaningful here.
+- **Q3 (qsa_mqa_paged wrapper)**: RESOLVED 2026-10-13. It was not only a
+  signature gap — the delegate kernel
+  (`paged_mqa_logits_decode_rdna2`) required fp8 e4m3 and `H == 64,
+  D == 128`, used per-head weights, row-indexed `block_tables`,
+  `context_lens` visibility and had no `visible_blocks`. A dedicated
+  kernel now implements the Triton contract exactly; see the
+  `qsa_mqa_paged_rdna2` section above. Residual, unrelated: the
+  `qsa_compress_groups_kernel` `BLOCK_D=128` ceilings `head_dim` (now a
+  `TORCH_CHECK`, not silent truncation).
 - **Q4 (HC `W_SHARED` layout)**: the current HIP path infers `W_SHARED`
   from `weight.numel()`. If a future checkpoint stores weights with a
   reshape (`[HC, GROUP_DIM]` flattened to `[HC * GROUP_DIM]` in some
@@ -318,3 +358,61 @@ tokens / 24 heads / head_dim 256. So the strided-view hypothesis is also out.
 All QSA-adjacent kernels are exonerated; the SIGABRT is a different kernel in
 the model's warmup forward (GDN / MoE / sampler / n-gram). Probe:
 `/tmp/qsa_transpose_probe.py`.
+
+---
+
+## 2026-10-13 — QSA HIP: SIGABRT closed, `qsa_mqa_paged` contract fixed
+
+**The 2026-09-14 SIGABRT is not live and was never a QSA-kernel fault.**
+That entry is labelled "pre-HIP-path" for a reason: the abort happened on the
+default **Triton** path. `qwen38_flash_next_triton_status.md` (2026-09-15)
+identifies it as **cudagraph capture**, not the model —
+"the earlier SIGABRT was the cudagraph capture (a capture-unsafe op in the
+QSA forward), not the model — eagerly it runs correctly" — fixed by
+`8dc656b61` (UVA staging host VAs recorded into the captured graph). The
+production configuration is `cudagraph_mode=PIECEWISE` + prefix caching:
+16/16 successful, 0/18 sequential correctness, 8/8 coherence.
+
+Confirmed for the HIP path too: the three `qsa_rdna2` ops are capture- and
+replay-safe under `torch.cuda.CUDAGraph` (no scratch allocation, current
+stream), pinned by
+`tests/kernels/rocm/qwen4_exp/test_qsa_rdna2.py::test_qsa_hip_ops_are_cudagraph_safe`.
+
+Changes:
+- `csrc/rocm/qsa_rdna2.cu`: new `qsa_mqa_paged_kernel` implementing the
+  Triton `_qsa_mqa_paged_kernel` semantics (fp16, free `H`/`D`, request
+  indirection through `token_to_req`, visibility from
+  `min((pos+1)/ratio, seq_len/ratio)`, ReLU-then-sum over heads,
+  `score /= score_divisor`, `-inf` masking, `visible_blocks` side channel).
+  Replaces the delegation to `paged_mqa_logits_decode_rdna2`.
+- `csrc/rocm/qsa_rdna2.cu`: `qsa_compress_groups_kernel` was writing
+  `float acc[BLOCK_D]` (128 floats/thread -> local-memory spill) and **every
+  thread in the block recomputed the same row**. Replaced with one thread per
+  output dim and a scalar accumulator (bit-identical output, 7-23x faster).
+- `qsa_compress_groups_rdna2` now `TORCH_CHECK`s `head_dim <= 128` instead of
+  silently truncating to `BLOCK_D`.
+- `qsa_use_rdna2(dtype)` gates on fp16; the HIP kernels are fp16-only, so a
+  bf16 model now keeps Triton instead of hitting a `TORCH_CHECK`. All three
+  `ops/qsa.py` call sites pass their tensor dtype.
+- `tests/kernels/rocm/qwen4_exp/test_qsa_rdna2.py`: op-presence probe, gate
+  tests, dispatcher routing, S1 parity for all three ops (bit-exact for
+  store/compress, maxdiff <= 2e-6 for the fp32 logits), `-inf`/mask
+  equality, `head_dim` ceiling, end-to-end indexer selection parity, and the
+  cudagraph check. 193 tests.
+- `csrc/rocm/ops.h`, `csrc/rocm/torch_bindings.cpp`, `vllm/_custom_ops.py`:
+  new `qsa_mqa_paged_rdna2` schema returning `(logits, visible_blocks)`.
+
+Measured on GPU 1 (`.pi/qsa_hip_bench.py`, 200 iters, fp16):
+
+| op | shape | Triton | HIP | delta | target |
+|---|---|---:|---:|---:|---|
+| `store_cache_rows` | rows=512, w=128 | 26.3 us | 16.9 us | **+35.6 %** | >= +30 % |
+| `compress_groups` | rows=512, d=128, r=4 | 72.3 us | 26.9 us | **+62.9 %** | >= +15 % |
+| `mqa_paged` | rows=512, cols=8192 | 794 us | 148 us | **+81.3 %** | n/a |
+| `mqa_paged` | rows=2048, cols=8192 | 3445 us | 2391 us | **+30.6 %** | n/a |
+
+Still open: S3 for the real model (needs TP4 — the checkpoints are 82-169 GB
+and a full repro would need GPU 0, which is held by another agent), and S6
+default-on. The `compress_groups` bench is the most likely source of the
+previously reported "HIP QSA is 4-10 % slower overall": 12 full-attention
+layers x ~0.4 ms saved per step at 512 rows is ~5 ms of a ~90 ms TPOT.

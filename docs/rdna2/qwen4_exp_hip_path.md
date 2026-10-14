@@ -69,8 +69,8 @@ target shapes.
 
 - `csrc/rocm/qsa_rdna2.cu` — 3 entry points:
   `qsa_store_cache_rows_rdna2`, `qsa_compress_groups_rdna2`,
-  `qsa_mqa_paged_rdna2` (thin wrapper that delegates to
-  `paged_mqa_logits_decode_rdna2`).
+  `qsa_mqa_paged_rdna2` (dedicated kernel matching the Triton
+  `qsa_mqa_paged` contract; fp16, free H/D, `visible_blocks` output).
 - Gate: `VLLM_RDNA_QSA_HIP=1` + `on_gfx10x()`.
 - Dispatcher: `vllm/models/qwen4_exp/amd/ops/qsa_rdna2.py`.
 - The splitk prefill attention stays on Triton (only fires at large M,
@@ -135,13 +135,14 @@ export VLLM_RDNA_PLE_CONV_HIP=1
 - **HC unroll factor**: the constexpr `HC` template covers `{1,2,4,8}`.
   Qwen4Exp defaults `hc_count=4`; other checkpoints may need additional
   values.
-- **QSA MQA paged signature alignment**: the HIP wrapper
-  (`qsa_mqa_paged_rdna2`) currently re-uses
-  `paged_mqa_logits_decode_rdna2` when the shape contract matches.
-  The Triton `qsa_mqa_paged` signature includes
-  `query_positions` / `sequence_lengths` / `compress_ratio` /
-  `score_scale` that the indexer doesn't use; a future PR can either
-  extend the wrapper to translate those or add a dedicated kernel.
+- **QSA MQA paged signature alignment**: done (2026-10-13). The wrapper
+  was never a shape-compatible reuse of
+  `paged_mqa_logits_decode_rdna2` (fp8, `H == 64 && D == 128`, per-head
+  weights, row-indexed `block_tables`, `context_lens` visibility, no
+  `visible_blocks`). A dedicated `qsa_mqa_paged_kernel` now implements the
+  Triton contract exactly: `(q, k_cache, page_table, token_to_req,
+  query_positions, sequence_lengths, compress_ratio, num_columns,
+  score_scale) -> (logits, visible_blocks)`.
 - **QSA sparse splitk attention**: ports well to RDNA2 (splitk +
   wave-per-row works similarly to `sparse_mla_decode_rdna2`); deferred
   until the prefill cudagraph story is solid.
