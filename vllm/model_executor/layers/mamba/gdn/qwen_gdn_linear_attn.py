@@ -133,6 +133,18 @@ _GDN_PREFILL_TIMING_N: dict[str, int] = {}
 
 
 class _GdnPrefillTimer:
+    """Times one region with CUDA events.
+
+    Events are only *recorded* on exit; nothing is synchronised until the
+    outermost region closes. An earlier version synchronised on every exit,
+    which made the measurement self-defeating: the HIP path has five nested
+    regions per chunk against Triton's two, so it paid five syncs and looked
+    ~280 us/call slower purely from the instrumentation.
+    """
+
+    _depth = 0
+    _pending: list = []
+
     __slots__ = ("name", "start", "end")
 
     def __init__(self, name):
@@ -144,26 +156,36 @@ class _GdnPrefillTimer:
             self.start = torch.cuda.Event(enable_timing=True)
             self.end = torch.cuda.Event(enable_timing=True)
             self.start.record()
+            _GdnPrefillTimer._depth += 1
         return self
 
     def __exit__(self, *exc):
         if not _GDN_PREFILL_TIMING:
             return False
         self.end.record()
+        _GdnPrefillTimer._pending.append((self.name, self.start, self.end))
+        _GdnPrefillTimer._depth -= 1
+        if _GdnPrefillTimer._depth == 0:
+            _GdnPrefillTimer._flush()
+        return False
+
+    @classmethod
+    def _flush(cls):
+        # One sync per call, after every end event has been recorded, so the
+        # sync itself never falls inside a measured window.
         torch.cuda.synchronize()
-        _GDN_PREFILL_TIMING_MS[self.name] = (
-            _GDN_PREFILL_TIMING_MS.get(self.name, 0.0)
-            + self.start.elapsed_time(self.end)
-        )
-        _GDN_PREFILL_TIMING_N[self.name] = _GDN_PREFILL_TIMING_N.get(self.name, 0) + 1
-        total = _GDN_PREFILL_TIMING_N[self.name]
-        if total % 200 == 0:
+        for name, start, end in cls._pending:
+            _GDN_PREFILL_TIMING_MS[name] = (
+                _GDN_PREFILL_TIMING_MS.get(name, 0.0) + start.elapsed_time(end)
+            )
+            _GDN_PREFILL_TIMING_N[name] = _GDN_PREFILL_TIMING_N.get(name, 0) + 1
+        cls._pending = []
+        if _GDN_PREFILL_TIMING_N and max(_GDN_PREFILL_TIMING_N.values()) % 200 == 0:
             parts = ", ".join(
                 f"{k}={v:.0f}ms/{_GDN_PREFILL_TIMING_N[k]}"
                 for k, v in sorted(_GDN_PREFILL_TIMING_MS.items())
             )
-            logger.info("GDN prefill HIP timing (%d calls/op): %s", total, parts)
-        return False
+            logger.info("GDN prefill HIP timing: %s", parts)
 
 
 def _prefill_scratch(role, shape, dtype, device):
