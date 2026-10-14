@@ -116,6 +116,42 @@ gates-off baseline; if QSA-only reproduces the -1.5 % then the cost is in the
 QSA dispatch path (score -> top-k -> expand, or the `visible_blocks` side
 channel), not in the kernels.
 
+#### Round 4 — attribution by arm
+
+| arm | prefill 8k tok/s | prefill 16k tok/s | decode TPOT p50 ms |
+|---|---:|---:|---:|
+| off | 1735.6 | 1811.4 | 12.09 |
+| QSA only | 1723.3 (-0.7 %) | 1799.7 (-0.6 %) | 11.28 (**-6.7 %**) |
+| both | 1703.2 (-1.9 %) | 1783.7 (-1.5 %) | 11.58 (-4.2 %) |
+
+So both gates cost a little prefill (QSA ~0.6 %, GDN ~0.9 %) and QSA buys
+decode. The off arm is stable to +/-0.4 % over six sessions, so these are real.
+
+**The unexplained part is that every offline kernel is now *faster* than
+Triton at production shapes while the server is slower.** Measured offline at
+the production chunk size (T=2048, `max_num_batched_tokens: 2048` confirmed
+from the live engine config):
+
+| measurement at T=2048 | Triton | HIP |
+|---|---:|---:|
+| sum of the five GDN kernels | 2867.6 | **2183.3 (-23.9 %)** |
+| whole chain, CUDA events | 1760.6 | 1875.3 (+6.5 %) |
+| whole chain, per-call sync | 1980.4 | 1969.9 (-0.5 %) |
+| `mqa_paged` rows=2048, ~4096 visible | 3555.8 | **3198.6 (-10.0 %)** |
+
+The kernel-level sum and the whole-chain number disagree, and the whole-chain
+number moves with the timer. That is the signature of **host-side per-call
+cost**, which event-over-a-loop timing hides: `_gdn_prefill_chain_rdna2` makes
+7 `torch.zeros` + 4 op launches per call and `qwen_gdn_linear_attn.py:1821`
+makes 5 more zeros, and with chunked prefill at 2048 that is 288 calls per 16k
+forward. Prefill is **not** cudagraphed here (`cudagraph_capture_sizes` is
+[3, 6, 12, 24] — decode only), so none of it is amortised.
+
+**Next step:** make the zeroing cheap rather than removing it — either have
+`gdn_prefill_prep_rdna2` zero its own out-of-bounds rows so the wrapper can
+pass `torch.empty`, or keep the buffers alive across calls. That targets the
+one mechanism the evidence actually points at.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
