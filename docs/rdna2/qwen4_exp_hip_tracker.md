@@ -553,6 +553,35 @@ at parity. But the two off arms differ from each other by 5 % throughput and
 repeats per arm inside one server lifetime (removing the model-load component
 that dominates the between-arm spread).
 
+#### Round 18 — the c=8 decode signal is dead; that metric has a 27 % spread
+
+Six repeats of the c=8 1k->512 decode shape per arm, inside one server lifetime
+(so the model-load component is removed), all arms health 200:
+
+| arm | repeats (tok/s) | median | spread |
+|---|---|---:|---|
+| off (1st) | 427.9, 438.8, 367.1, 294.7, 274.4, 264.0 | 330.9 | 1.66x |
+| on | 180.5, 276.2, 259.4, 406.7, 450.1, 376.2 | 326.2 | **2.49x** |
+| off (3rd) | 421.1, 421.9, 434.8, 430.3, 419.8, 408.1 | **421.5** | 1.07x |
+
+**The two gates-off arms are the same configuration and differ by +27 % in
+median** (330.9 vs 421.5), and the first arm degrades monotonically (427.9 ->
+264.0) while the third is flat. So the c=8 decode metric has a same-config
+between-arm spread of ~27 %, an order of magnitude worse than prefill's +/-1 %,
+and **round 17's "+11 %/+17 % decode" was one draw from a very wide
+distribution, not a win.** Withdrawn.
+
+Note the *on* arm was the most variable of the three (2.49x). That is worth a
+second look on a quiet box, but with one arm showing it and the other two not,
+it cannot be attributed to the gates here.
+
+**Consequence for the goal:** both routes to an end-to-end win are now closed.
+Prefill is parity within +/-1 %, and the only metric that showed a large gate
+advantage is unusable (27 % same-config spread). Decode at c=1 (128->256) is more
+stable (~6 %) but showed parity. So "beat Triton end-to-end" is not demonstrable
+on this box by any measurement that is stationary, and the kernel-level results
+(GDN -23.9 % at T=2048, -10.8 % in-server) remain the evidence.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
