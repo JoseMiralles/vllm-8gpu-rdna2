@@ -875,9 +875,12 @@ def _sparse_inputs(
 @pytest.mark.parametrize("heads,kv_heads", [(4, 1), (2, 2)])
 @pytest.mark.parametrize("topk", [8, 64, 129])
 @pytest.mark.parametrize("rows", [1, 7, 40])
-def test_sparse_paged_attention_parity(triton_gate, heads, kv_heads, topk, rows):
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_sparse_paged_attention_parity(
+    triton_gate, heads, kv_heads, topk, rows, head_dim
+):
     """HIP sparse attention must match the Triton splitk + merge pair."""
-    page_size, num_pages, num_requests, head_dim = 16, 64, 4, 128
+    page_size, num_pages, num_requests = 16, 64, 4
     q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
         rows, heads, kv_heads, head_dim, topk, page_size, num_pages, num_requests,
         seed=rows * 7 + topk,
@@ -940,3 +943,51 @@ def test_sparse_paged_attention_routes_to_hip_only_for_fp16(monkeypatch):
         q, k_cache, v_cache, logical, block_table, token_to_req
     )
     assert seen == [torch.float16]
+
+
+# Production Qwen4Exp text geometry: head_dim 256, partial_rotary_factor 0.25,
+# mrope_section [11, 11, 10] (sums to rotary_dim // 2).
+_MROPE_HD, _MROPE_RD = 256, 64
+_MROPE_SECTION = [11, 11, 10]
+
+
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("interleaved", [True, False])
+def test_mrope_forward_rdna2_matches_triton(is_neox_style, interleaved):
+    """The HIP M-RoPE kernel must match ``triton_mrope`` for every layout."""
+    from vllm.model_executor.layers.rotary_embedding.mrope import (
+        mrope_forward_rdna2,
+        triton_mrope,
+    )
+
+    torch.manual_seed(0)
+    tokens, n_qh, n_kh = 7, 6, 1
+    q = torch.randn(tokens, n_qh * _MROPE_HD, dtype=torch.float16, device=device)
+    k = torch.randn(tokens, n_kh * _MROPE_HD, dtype=torch.float16, device=device)
+    cos = torch.randn(3, tokens, _MROPE_RD // 2, dtype=torch.float16, device=device)
+    sin = torch.randn(3, tokens, _MROPE_RD // 2, dtype=torch.float16, device=device)
+
+    ref_q, ref_k = triton_mrope(
+        q.clone(),
+        k.clone(),
+        cos,
+        sin,
+        _MROPE_SECTION,
+        _MROPE_HD,
+        _MROPE_RD,
+        interleaved,
+        is_neox_style,
+    )
+    assert mrope_forward_rdna2(
+        q,
+        k,
+        cos,
+        sin,
+        _MROPE_HD,
+        _MROPE_RD,
+        _MROPE_SECTION,
+        interleaved,
+        is_neox_style,
+    )
+    torch.testing.assert_close(q, ref_q, atol=1e-3, rtol=1e-2)
+    torch.testing.assert_close(k, ref_k, atol=1e-3, rtol=1e-2)
