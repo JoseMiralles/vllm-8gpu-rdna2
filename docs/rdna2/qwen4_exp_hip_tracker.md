@@ -404,6 +404,40 @@ amount of work — a cost that appears outside every QSA op bench. Test by timin
 the sparse-attention kernels in both arms, or by comparing the token counts the
 indexer returns.
 
+#### Round 13 — QSA measured directly; the decomposition moves
+
+First attempt failed for an environmental reason, not a code one: the second arm
+started 6 s after the first was killed, while four orphaned `VLLM::Worker_TPn_EPn`
+processes still held 98 GB across the GPUs, so it died at init with "Engine core
+initialization failed" and no memory error (see the operational gotchas above).
+Re-run with an anchored kill and a wait for VRAM to free, **both arms health 200**:
+
+| arm | prefill 8k tok/s | prefill 16k tok/s |
+|---|---:|---:|
+| off | 1731.8 | 1809.2 |
+| QSA only | 1718.9 (**-0.75 %**) | 1799.4 (**-0.54 %**) |
+
+So QSA is **-0.5 to -0.75 %** on prefill, not the ~-1.6 % round 12 derived by
+subtracting the in-server GDN figure from the both-gates figure. Subtracting
+QSA from "both" instead gives **GDN-only ~ -0.65 % (8k) / -0.11 % (16k)** — while
+the in-server probe says GDN is **+0.5 %** (1.40 vs 1.57 ms/call).
+
+**Where this leaves it.** Measured within-session, arms healthy, in both compile
+modes:
+
+| configuration | prefill 8k | prefill 16k |
+|---|---:|---:|
+| both gates | -1.4 % (compiled) / -1.6 % (-O0) | -0.65 % / -1.1 % |
+| QSA only | -0.75 % | -0.54 % |
+| GDN only (by subtraction) | ~-0.65 % | ~-0.11 % |
+
+Every gate costs a small amount of prefill that **no kernel measurement and not
+the compiled graph explains**, and it is the same magnitude (0.5-1 %) whatever
+subset of the gates is enabled. That points at per-arm Python/dispatch work in
+the model layer rather than at the kernels — but it is bounded now, and it is at
+the resolution limit of the end-to-end measurement, so the conclusion does not
+change: **the gates are at parity-to-slightly-behind, and correctly stay off.**
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
