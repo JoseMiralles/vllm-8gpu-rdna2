@@ -438,6 +438,38 @@ the model layer rather than at the kernels — but it is bounded now, and it is 
 the resolution limit of the end-to-end measurement, so the conclusion does not
 change: **the gates are at parity-to-slightly-behind, and correctly stay off.**
 
+#### Round 14 — the QSA A/B/A dissolves QSA's cost; the residual is GDN
+
+Same control that held for the both-gates case, applied to QSA-only. All three
+arms health 200, within-session:
+
+| arm | prefill 8k tok/s | prefill 16k tok/s |
+|---|---:|---:|
+| off (1st) | 1727.0 | 1803.5 |
+| QSA only (2nd) | 1721.7 | 1800.3 |
+| off (3rd) | 1712.8 | 1799.1 |
+
+**The off arm itself drifts down** by -0.8 % (8k) / -0.24 % (16k) between the
+first and third arm — as large as the QSA delta — and QSA-only sits *between*
+the two off values. So QSA's apparent -0.75 %/-0.54 % is ordering drift:
+**QSA is at parity**, and the round-13 figure is withdrawn.
+
+That localises the whole residual to **GDN**: round 7's both-gates A/B/A had
+off-1st 1734.8, on-2nd 1705.1, off-3rd 1722.8, so the on arm sat 1.0 % *below*
+the third off arm and the deficit survived the control there.
+
+**The contradiction is now entirely about GDN**: every isolated measurement says
+it is faster (offline kernels -23.9 % at T=2048, offline whole chain -5.6 %, and
+the clean in-server probe -10.8 %, i.e. +0.5 % of prefill), while the end-to-end
+both-gates A/B/A says ~-1 %. The next measurement is the same A/B/A control for
+GDN-only, which decides it: if GDN-only also sits between the two off arms, the
+gates are at parity and the residual was ordering drift all along.
+
+**Measurement lesson:** the off arm drifts by up to 0.8 % between the first and
+third run in a session, which is the same size as every effect being chased here.
+Every gate comparison in this tracker that ran off-first-then-on is therefore
+suspect unless it was an A/B/A. The both-gates one was; the QSA one was not.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
