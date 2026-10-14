@@ -99,6 +99,39 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+# Scratch buffers reused across GDN prefill calls. The key MUST carry a role
+# name: w is [B, T, H, K] and u/v_new are [B, T, H, V], which are the same
+# shape and dtype, and so are the caller's q and k -- a shape-only key makes
+# them alias one buffer and silently corrupts the result.
+#
+# Every element is written by the kernels before it is read -- the
+# out-of-bounds rows are guarded at the read site (kkt zero-fills its LDS tile,
+# solve_wy its s_A, delta_h/o by t_len/valid_rows), not zero-filled at the
+# write site -- so a reused buffer needs no re-zeroing.
+#
+# Why it matters: prefill is chunked at --max-num-batched-tokens, so a 16k
+# prompt is ~8 calls per GDN layer per forward; at 36 layers that is ~288 calls
+# each doing 7 allocations + 7 memsets here and 5 more in the caller. Prefill
+# is not cudagraphed on this deployment (cudagraph_capture_sizes is decode-only)
+# so none of it is amortised, and it is host-side cost the offline kernel
+# benches cannot see.
+#
+# Tensors that are *returned* (o, final_state) are deliberately NOT cached: the
+# caller keeps a reference, and a later call would silently overwrite it.
+_GDN_PREFILL_SCRATCH: dict[tuple, torch.Tensor] = {}
+
+
+def _prefill_scratch(role, shape, dtype, device):
+    key = (role, tuple(shape), dtype, str(device))
+    buf = _GDN_PREFILL_SCRATCH.get(key)
+    if buf is None:
+        # zeros, not empty: this still commits the pages, which cudagraph
+        # capture relies on, but only once instead of once per call.
+        buf = torch.zeros(shape, dtype=dtype, device=device)
+        _GDN_PREFILL_SCRATCH[key] = buf
+    return buf
+
+
 def _gdn_prefill_chain_rdna2(
     q: torch.Tensor,  # [1, L, Hg, K] fp16 (from prep, B=1)
     k: torch.Tensor,  # [1, L, Hg, K] fp16
@@ -128,17 +161,15 @@ def _gdn_prefill_chain_rdna2(
     V = v.shape[-1]
     BT = chunk_size
 
-    A = torch.zeros(B, T, H, BT, dtype=torch.float32, device=q.device)
-    A_inv = torch.zeros(B, T, H, BT, dtype=q.dtype, device=q.device)
-    w = torch.zeros(B, T, H, K, dtype=q.dtype, device=q.device)
-    u = torch.zeros_like(v)
+    A = _prefill_scratch("A", (B, T, H, BT), torch.float32, q.device)
+    A_inv = _prefill_scratch("A_inv", (B, T, H, BT), q.dtype, q.device)
+    w = _prefill_scratch("w", (B, T, H, K), q.dtype, q.device)
+    u = _prefill_scratch("u", tuple(v.shape), q.dtype, q.device)
     NT = chunk_indices.shape[0]
     # h matches the reference chunk_gated_delta_rule_fwd_h layout: 5D
-    # [B, NT, H, V, K] (B=1 for the varlen prefill path). torch.zeros
-    # (not torch.empty) to commit pages on RDNA2 — cudagraph capture
-    # bakes tensor addresses; uncommitted pages fault on replay.
-    h = torch.zeros(B, NT, H, V, K, dtype=q.dtype, device=q.device)
-    v_new = torch.zeros_like(v)
+    # [B, NT, H, V, K] (B=1 for the varlen prefill path).
+    h = _prefill_scratch("h", (B, NT, H, V, K), q.dtype, q.device)
+    v_new = _prefill_scratch("v_new", tuple(v.shape), q.dtype, q.device)
     final_state = torch.zeros_like(initial_state)
 
     ops = torch.ops._rocm_C
@@ -1826,11 +1857,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 _V = self.head_v_dim
                 _dev = conv_output_prefill.device
                 _dtype = conv_output_prefill.dtype
-                query_non_spec = torch.zeros(_L, _H, _K, dtype=_dtype, device=_dev)
-                key_non_spec = torch.zeros(_L, _H, _K, dtype=_dtype, device=_dev)
-                value_non_spec = torch.zeros(_L, _HV, _V, dtype=_dtype, device=_dev)
-                g_non_spec = torch.zeros(_L, _HV, dtype=torch.float32, device=_dev)
-                beta_non_spec = torch.zeros(_L, _HV, dtype=torch.float32, device=_dev)
+                # Reused scratch: inputs to the chain, not read afterwards.
+                # Distinct roles because q and k are the same shape/dtype.
+                query_non_spec = _prefill_scratch("prep_q", (_L, _H, _K), _dtype, _dev)
+                key_non_spec = _prefill_scratch("prep_k", (_L, _H, _K), _dtype, _dev)
+                value_non_spec = _prefill_scratch("prep_v", (_L, _HV, _V), _dtype, _dev)
+                g_non_spec = _prefill_scratch("prep_g", (_L, _HV), torch.float32, _dev)
+                beta_non_spec = _prefill_scratch(
+                    "prep_beta", (_L, _HV), torch.float32, _dev
+                )
                 torch.ops._rocm_C.gdn_prefill_prep_rdna2(
                     conv_output_prefill,
                     a_prefill,
