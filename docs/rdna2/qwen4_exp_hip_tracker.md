@@ -1043,6 +1043,29 @@ on this box — the same-config arms agree to <0.2 %, whereas the prefill gate A
 had ~1 % same-config spread. A ~1 % effect is only claimable when the arms are
 that tight, which is why the gate results stay "parity".
 
+### Isolating the 84 new rows (44-row vs 128-row profile)
+
+Swapping the profile's rows per arm, same server recipe:
+
+| shape | 44 rows | 128 rows | delta |
+|---|---:|---:|---:|
+| prefill 16k tok/s | 1721.2 | 1710.4 | -0.63 % (noise; the M sets are disjoint so nothing is expected here) |
+| decode TPOT p50, 512 out | 11.69 ms | **10.80 ms** | **-7.6 %** |
+| decode TPOT p50, 256 out | 12.45 ms | 12.32 ms | -1.0 % |
+
+**Caveat: this is two single samples, not an A/B/A** -- the third arm failed to
+start (health 000, the orphaned-worker/VRAM trap) and there is no repeat control.
+The decode 512 reading of 10.80 ms is below every other c=1 decode reading taken
+here (11.2-12.5 ms), which is consistent with tuning the M <= 32 shapes being
+worth something, but a single sample below the observed range is not proof. **Re-run
+it as an A/B/A with the VRAM wait fixed before quoting the -7.6 %. the on/off
+A/B/A above (which is well-controlled) already establishes that TunableOp as a
+whole is worth ~+0.95 % prefill.**
+
+The swap restores the tracked CSVs and verifies the sha256 against the committed
+128-row files; it printed "restored to the committed 128-row version" and
+`git status` shows no modification.
+
 ## Next actions (priority-ordered)
 
 1. **[blocking, highest value] Get a per-kernel view of the live server.**
