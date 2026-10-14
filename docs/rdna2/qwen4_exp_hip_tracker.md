@@ -1480,3 +1480,64 @@ proof that counter reductions here do not imply speed.
 
 Until the rewrite lands, `VLLM_RDNA_QSA_HIP=1` should stay off: previously it made
 the QSA path a wash (HIP indexer + Triton attention), and it is now a net loss.
+
+## TunableOp: the whole grid re-measured, and the 256/512-token chunk family (2026-10-14)
+
+`tools/rdna2/check_v620_tuning.py` reported **7 of the 14 shapes the live cache/batch
+config needs as missing** — the live launcher resolves to `--block-size 1024
+--max-num-batched-tokens 2048`, so the chunks that actually run are M = 1024 and 2048.
+Two mechanisms had kept them missing, and both are deliberate:
+
+1. `tools/rdna2_028/tunableop_rows_pipeline.sh` tunes **only the shapes present in
+   `--shape-source`**, so the 26 prefill shapes the 2026-10-12 curation dropped were
+   never re-tested.
+2. `curate_tunableop_rows.py` folds `Default` rows into `dropped` by design ("an absent
+   row and a `Default` row are behaviourally identical").
+
+All 168 shapes (7 dense `(N,K)` x 12 prefill M + the 84 decode/MTP rows) were therefore
+re-tuned and then measured heuristic / current / new **in one session** (the 3 % margins
+are meaningless across sessions: the same rows drift 5-10 %).
+
+**The 7 live-grid holes stay holes.** A fresh tune does not beat the heuristic by 3 % on
+any of them (`10240x320`, `4096x2560`, `2560x1536`, `3584x2560` at M=1024; `10240x320`,
+`512x2560`, `10240x2560` at M=2048). Filling them with an explicit `Default` row would
+silence the warning without changing behaviour, and would pin those shapes against online
+tuning — so the warning is left as-is. It is telling the truth.
+
+**The real gap was one the checker cannot express.** The live launcher sets
+`VLLM_RDNA_DYNAMIC_PREFILL=1`; its ladder is `RUNGS = (256, 512, 1024)` with
+`LPT_SHARED = 512`, and `scheduler.py` sets `num_new_tokens = long_prefill_token_threshold`
+whenever more than one request is eligible. At ≥4 eligible requests a **512-token chunk**
+reaches the GEMMs, and 256 at 8 — and there was no row for M = 256/512 at all.
+`check_v620_tuning.py` takes only `--block-size`/`--max-num-batched-tokens`, so it cannot
+see this family.
+
+| shape | M | heuristic | tuned row | delta |
+|---|---:|---:|---:|---:|
+| `10240x2560` | 512 | 4.33 ms | **1.22 ms** | −72 % |
+| `336x10240` | 512 | 1.05 ms | **0.24 ms** | −77 % |
+| `10240x2560` | 256 | 2.32 ms | **0.59 ms** | −75 % |
+| `512x2560` | 512 | 0.229 ms | **0.102 ms** | −55 % |
+| `2560x1536` | 512 | 0.243 ms | **0.207 ms** | −15 % |
+| `3584x2560` | 800 | 0.851 ms | **0.728 ms** | −15 % |
+
+The tuned solver reaches ~22 TFLOPS on the large-K shapes where the heuristic manages ~6,
+so these are real, not noise. 11 rows added; 2 shipped prefill rows replaced by a
+*different* faster solver (`10240x2560` M=1024, `2560x1536` M=3200).
+
+**Two traps worth remembering.** (a) Two further "adopt" decisions carried the *same*
+solver id as the shipped row — same-session noise, not a better kernel — and were
+rejected; only adopt when the solver actually changes. (b) 18 decode/MTP rows (M=2..8)
+measured 10-77 % slower than the heuristic, which looks damning, but that region is
+launch-bound: identical shape families flip sign between M=1 (row 22-58 % *faster*) and
+M=2..8, on ~14 MFLOP GEMMs timed at 80-240 µs. The decode grid is left byte-identical;
+deleting those rows needs a small-M measurement (no per-call sync, larger reps) first.
+
+Result: **139 rows/rank** (55 prefill + 84 decode/MTP), **139/139 matched independent FP32
+on all four devices**, **139/139 lookup hits, 0 misses**. `tests/tools/test_v620_tuning_coverage.py`
+passes; note that it asserts the *warning* path, so a green test is not a completeness proof.
+
+Not yet measured: the end-to-end size of the 256/512 win. It only materialises when the
+controller is in the shared cell, so a single-request prefill benchmark will not show it —
+that needs a mixed-load run with ≥4 eligible requests plus a `[dyn-prefill] ADJUST` line
+confirming a 512 cap.
