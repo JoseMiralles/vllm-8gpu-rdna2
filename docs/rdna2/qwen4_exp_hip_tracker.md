@@ -245,8 +245,19 @@ Ruled out this round, with evidence:
   API-side trace, but the **worker** traces never flush — "Stopping profiler..."
   was logged and then nothing for 3 minutes, and only
   `*.async_llm.*.pt.trace.json.gz` (CPU `python_function` events only) appeared.
-  `rocprofv3 --attach` is also unusable here. **This box cannot currently give a
-  per-kernel view of a live server**, which is what the last 250 ms needs.
+  `rocprofv3 --attach` is also unusable here.
+- **`rocprofv3` in application mode** (launching the server under it, which
+  needs no attach support) starts and serves, but kernel tracing slows a 16k
+  prefill past 25 minutes — the bench sat at 0/1 with the server still
+  logging — so it cannot produce the window in reasonable time at this input
+  length. A shorter input (1-2k) might be tractable, but then the GDN chain is
+  a larger fraction of the step than in the case being explained.
+
+**This box cannot currently give a per-kernel view of a live 16k prefill**,
+which is what the last ~170 ms needs. Every in-server route is exhausted;
+the remaining options are to build/instrument the GDN layer with
+`torch.cuda.Event` counters behind an env var, or to reason from a smaller
+input length.
 
 #### What the remaining -1.9 % is not
 
