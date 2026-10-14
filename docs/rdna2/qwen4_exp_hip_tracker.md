@@ -1394,3 +1394,51 @@ Superseded on 2026-10-13: S3 is done (see the S3 serving A/B section) —
 `VLLM_RDNA_QSA_HIP=1` is worth ~9.7 % decode TPOT, and
 `VLLM_GDN_HIP_PREFILL=1` costs ~5.5 % prefill. Both defaults stay "0" until
 the remaining GDN prefill kernels are profiled.
+
+## QSA sparse attention ported: the QSA path is now fully HIP (2026-10-13)
+
+`_qsa_sparse_paged_gqa_splitk_kernel` + `_qsa_merge_splitk_kernel` are now
+implemented as `qsa_sparse_paged_attention_rdna2` (split-K, warp-per-GQA-head,
+base-2 online softmax, fp32 partials merged by log-sum-exp). With
+`VLLM_RDNA_QSA_HIP=1`, **no Triton kernel runs in the QSA path any more** — the
+three leftovers (expand, splitk, merge) are all HIP.
+
+Correctness is solid: **bit-exact against Triton on the `num_splits == 1` path**,
+and 3–6e-5 abs / ~1e-3 rel (1–2 fp16 ulps) with splits, where the only difference
+is the merge reordering the partial sums. 22 new cases in `test_qsa_rdna2.py`
+(GQA 4/1 and 2/2, topk 8/64/129, rows 1/7/40, a fully masked row, `out=`), and the
+tolerance is pinned at `rtol=5e-3, atol=1e-4` rather than a loose 1e-2 that would
+hide a real bug. Full GDN+QSA suite: 408 passed.
+
+**It is slower than Triton, so enabling that flag is now a regression.** Kernel
+time, GPU 0, `torch.profiler`, 30 iters:
+
+| shape | Triton | HIP | delta |
+|---|---:|---:|---:|
+| decode `rows=8, topk=512` | 56.2 us | 105.2 us | +87 % |
+| prefill `rows=512, topk=2048` | 800.9 us | 2072.3 us | +159 % |
+| GQA2 `rows=64, topk=1024` | 216.4 us | 585.3 us | +170 % |
+
+This is a deliberately simple first version, written for correctness. Identified
+fixes in expected-value order:
+
+1. **Every query head's warp gathers the same K/V independently** — `group_size`
+   warps re-read the identical K rows and the identical 128 V dims, so the global
+   read count is `group_size`x what it needs to be. Stage K and V once per tile
+   in LDS (vectorised 8-wide gather, shared by the group).
+2. **The index -> logical page -> physical page lookup runs twice per column**,
+   in the score loop and again in the `P @ V` loop. Compute it once per tile into
+   LDS and share it across the warps.
+3. **The `P @ V` accumulation is scalar fma.** Transposing `v` in LDS enables the
+   pair-over-column `fdot2` form sketched in the design notes.
+4. `q` is re-read from global for every column of the score dot.
+
+A first attempt at (4) — hoisting `q` into a register array — was **reverted**:
+`head_dim` is a runtime value, so `q_reg[d2]` is dynamically indexed and the
+resource probe shows scratch memory appearing (272 B/lane) instead of registers,
+which would pessimise rather than help. Doing it properly requires templating the
+kernel on `HEAD_DIM` (instantiate 128, the indexer's actual size) or otherwise
+giving the loop a compile-time trip count.
+
+Until these land, `VLLM_RDNA_QSA_HIP=1` should stay off: previously it made the
+QSA path a wash (HIP indexer + Triton attention), and it is now a net loss.
