@@ -302,13 +302,29 @@ HIP-vs-Triton delta that does not name its timer.
   `VLLM_RDNA_QSA_HIP=1` now also runs (see the S3 serving A/B section):
   decode TPOT p50 11.82 -> 10.67 ms, prefill unchanged within noise.
 - [x] **S5 bench** — fp16, `H` free, `D <= 128` (indexer is 4 x 128),
-  `compress_ratio = 4`, `rows=512`, 8192 columns, GPU 1: kernel **738.7 us
-  Triton vs 73.5 us HIP (+90.0 %)**; call-level 746 us vs 231 us (+69 %).
-  This is the one QSA op where HIP wins outright, and it wins on kernel time,
-  not launch overhead: the HIP kernel skips the columns outside each row's
-  visible range, while the Triton kernel masks them but still computes them.
-  The dense fast path uses `v_dot2` (2 MAC/inst) when the rows are contiguous
-  with even head_dim, with a scalar fallback for strided views.
+  `compress_ratio = 4`. **The delta depends on where the chunk sits in the
+  sequence**, because the HIP kernel `return`s early for `col >= visible`
+  while the Triton kernel masks but still computes every column:
+
+  | rows | visible | Triton us | HIP us | delta |
+  |---|---:|---:|---:|---:|
+  | 512 | ~128 | 738.7 | 73.5 | **-90.0 %** |
+  | 2048 | ~512 | 3141.0 | 601.0 | **-80.9 %** |
+  | 2048 | ~4096 | 3555.8 | 3198.6 | **-10.0 %** |
+  | 2048 | full | 3586.7 | 3199.9 | **-10.8 %** |
+  | 16384 | ~4096 | 28216.3 | 15013.3 | -46.8 % |
+
+  The rows=512/early rows are the *best* case for HIP and were the only ones
+  measured at first, which is why this op was reported as a pure win. Real
+  prefill chunks at `--max-num-batched-tokens 2048` and its later chunks are
+  the dense case, where HIP used to be **+27 % slower** — that, not GDN, was
+  the residual gates-on prefill regression.
+- [x] **perf fix — dense path.** It was simply a worse kernel than Triton's:
+  one 4-byte load per f16x2 operand (512 loads per column) and all 64 fdot2 of
+  a head accumulated into a single register, a 64-deep dependent chain. Now
+  128-bit loads and four independent accumulator chains:
+  dense 4558 -> 3199 us (+27 % -> -10 %), early 683 -> 601 us.
+- [ ] **S6 default-on** — deferred until the real-forward S3 run lands.
 - [ ] **S6 default-on** — deferred until the real-forward S3 run lands.
 
 ---
