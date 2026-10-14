@@ -180,6 +180,27 @@ Prefill, by contrast, is order-insensitive: the off arm read
 1735.6 / 1811.4 (1st) and 1721.7 / 1806.6 (4th), so the -1.5 to -1.9 % gates-on
 prefill cost is real.
 
+#### Round 6 — host-side per-call cost, and the fix for it
+
+Round 4 showed the whole-chain number changing sign with the timer, which is
+the signature of host-side cost. Confirmed and fixed: `_gdn_prefill_chain_rdna2`
+allocated 7 tensors with `torch.zeros` per call and `qwen_gdn_linear_attn.py`
+made 5 more, so 12 allocations + 12 memsets per call, and chunked prefill at
+2048 makes ~288 calls per 16k forward with **no cudagraph to amortise them**
+(`cudagraph_capture_sizes` is [3, 6, 12, 24] — decode only).
+
+They are now reused, keyed by `(role, shape, dtype, device)`. The role name is
+load-bearing: `w` is [B,T,H,K] and `u`/`v_new` are [B,T,H,V] — same shape and
+dtype — as are the caller's `q` and `k`, so a shape-only key aliased them and
+corrupted the chain (21.9 % of elements off by up to 0.043). The chain test
+caught it. Returned tensors (`o`, `final_state`) are deliberately not cached.
+
+  T=2048 whole chain, CUDA events:    1875.3 -> 1773.5 us (Triton 1754.6)
+  T=2048 whole chain, per-call sync:  1969.9 -> 1880.3 us (Triton 1991.8)
+
+So with host cost included the HIP chain is now **-5.6 %** at the production
+chunk size instead of +6.5 %.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
