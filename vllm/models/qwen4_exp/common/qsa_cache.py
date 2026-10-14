@@ -563,25 +563,18 @@ def _build_qsa_metadata_torch(
     return token_to_req, logical_positions, visible_blocks, slot_mapping
 
 
-# Resolve the fallback outside the per-step metadata hot path. On gfx1030 with the
-# HIP QSA gate on, this Triton builder is the last Triton kernel left in the QSA
-# path, so it is routed to the pure-torch builder instead (parity-checked against
-# the Triton one in tests/models/qwen4_exp/test_qsa_reference.py).
-def _use_triton_qsa_metadata() -> bool:
-    if not HAS_TRITON:
-        return False
-    from vllm.envs import VLLM_RDNA_QSA_HIP
-    from vllm.platforms.rocm import on_gfx10x
-
-    return not (bool(VLLM_RDNA_QSA_HIP) and on_gfx10x())
-
-
+# Resolve the fallback outside the per-step metadata hot path.
+#
+# NOTE (2026-10-14): the gfx1030 HIP gate used to route this to
+# `_build_qsa_metadata_torch` to keep Triton out of the QSA path. That is a
+# ~13 % decode regression: at a decode step the torch builder issues ~77
+# eager kernel launches (817 us/call measured) against this single Triton
+# kernel (58 us/call), and the metadata build runs twice per step. The
+# no-Triton invariant therefore stops here until this builder has a HIP
+# kernel of its own; the torch builder stays for non-Triton platforms.
 build_qsa_metadata = (
-    build_qsa_metadata_triton
-    if _use_triton_qsa_metadata()
-    else _build_qsa_metadata_torch
+    build_qsa_metadata_triton if HAS_TRITON else _build_qsa_metadata_torch
 )
-
 
 @dataclass
 class QSAForwardMetadata(AttentionMetadata):
