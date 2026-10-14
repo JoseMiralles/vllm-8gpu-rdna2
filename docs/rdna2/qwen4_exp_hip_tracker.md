@@ -98,6 +98,24 @@ Prefill, by contrast, is stable: the off arm has read 1809.6 / 1801.2 / 1806.8
 climbed 1705.7 -> 1773.0 -> 1781.5 as the kernels were fixed. So **-1.9 % is
 real, down from -4.4 % before this work**.
 
+#### Round 3 — after the mqa_paged dense-path fix
+
+| metric | off | on | delta |
+|---|---:|---:|---:|
+| prefill 8k, total tok/s | 1735.6 | 1703.2 | -1.9 % |
+| prefill 16k, total tok/s | 1811.4 | 1783.7 | -1.5 % |
+| prefill 16k, TTFT p50 ms | 9553.9 | 9677.7 | +1.3 % |
+| decode 128+256, TPOT p50 ms | 12.09 | 11.58 | -4.2 % |
+
+Still ~-1.5 %, so the mqa fix did **not** move it, even though the offline
+numbers say it should have (the dense case went 4558 -> 3199 us, worth ~125 ms
+across 12 layers x 8 chunks). **The offline kernel wins are not showing up
+end to end, which means the cost is somewhere the offline harnesses do not
+reach.** The next attribution step is a QSA-only arm against the same
+gates-off baseline; if QSA-only reproduces the -1.5 % then the cost is in the
+QSA dispatch path (score -> top-k -> expand, or the `visible_blocks` side
+channel), not in the kernels.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
