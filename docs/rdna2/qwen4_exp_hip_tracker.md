@@ -76,6 +76,23 @@ Caveat: the repo's own notes record ~10 % session-to-session drift on these
 serving numbers, so only the within-session A/B above is meaningful, and it is
 one workload (concurrency 1, no prefix-cache hits).
 
+### Re-run after the LDS-staged delta_h
+
+Two arms only (QSA is unaffected by that change), same harness and workload:
+
+| metric | off | GDN only | delta |
+|---|---:|---:|---:|
+| prefill 8k, total tok/s | 1717.7 | 1645.8 | -4.2 % |
+| prefill 16k, total tok/s | 1806.8 | 1726.7 | -4.4 % |
+| prefill 16k, TTFT p50 ms | 9548.3 | 10020.2 | +4.9 % |
+| decode 128+256, TPOT p50 ms | 11.75 | 11.51 | -2.0 % |
+
+So the GDN gate went from -5.5 % to **-4.4 %** prefill — the LDS staging bought
+about one point of the end-to-end cost, not the whole thing. The remaining
+~4 % is in `gdn_prefill_{prep,kkt,solve_wy,o}_rdna2`, which are still
+unprofiled. The decode number is a control (GDN does not run in a decode step)
+and its -2 % is the noise floor of this workload.
+
 ---
 
 ## HC prefill HIP
