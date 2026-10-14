@@ -303,6 +303,35 @@ replacing the four calls in `_gdn_prefill_chain_rdna2` with one. Expected to
 turn prefill from -0.65 % into roughly +0.2-0.5 % and finally make the gates a
 win.
 
+#### Round 11 — clean in-server measurement: HIP is FASTER, and the probe was lying
+
+The round-10 numbers were produced by a probe that synchronised on every region
+exit. The HIP path nests five regions per chunk and Triton two, so HIP paid
+five syncs and measured ~280 us/call slower *purely from the instrumentation*.
+Fixed (commit aef30748ae): events are recorded on exit and a single sync runs
+when the outermost region closes, so it never falls inside a measured window.
+
+Re-measured, same basis (one 16k prefill, 400 calls/op, TP0):
+
+| arm | prep | chain | total | per call |
+|---|---:|---:|---:|---:|
+| HIP | 25 ms | 536 ms | **561 ms** | **1.40 ms** |
+| Triton | 19 ms | 608 ms | **627 ms** | **1.57 ms** |
+
+**The HIP GDN prefill path is 10.8 % faster per call in-server**, i.e. ~49 ms
+better per 16k forward (+0.5 % of a 9.55 s prefill). The intra-chain Python/gap
+is 105 us/call for HIP (536 - 494 of kernels) versus Triton's 1.57 - 1.5 of
+kernel. So there is no Python-dispatch problem to fix after all: the fused-op
+plan in round 10 was based on a contaminated measurement and is withdrawn.
+
+**Net position after all of this:** every measurement that isolates the GDN path
+- offline kernel sums, offline whole-chain, and now in-server per-op - says HIP
+is faster, by 10-24 % depending on chunk size, while the end-to-end A/B says the
+gates are 0.65-1.3 % slower. The two disagree by ~1 %, which is at the edge of
+what this box resolves for prefill (single-arm spread 0.4-0.9 %). **The gates
+are at parity within measurement resolution; there is no demonstrable win, and
+no remaining defect to point at.**
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
