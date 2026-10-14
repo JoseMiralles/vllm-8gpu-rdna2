@@ -509,6 +509,25 @@ between-arm spread that is not ordering, so any single off-then-on comparison
 here — including several earlier in this tracker — cannot resolve the effects
 being discussed. Use A/B/A and treat anything under ~1 % as unresolved.
 
+#### Round 16 — PR #64's c=8 validation row
+
+PR #64's validation list specifies c=1 **and c=8**; only c=1 had ever been run
+here. Three arms at `--max-concurrency 8`, `--ignore-eos`, TTFT and TPOT:
+
+| shape (c=8) | gates on | gates off | delta |
+|---|---:|---:|---:|
+| prefill 8k (32 prompts) | 1824.0 tok/s | 1828.8 | -0.26 % |
+| prefill 16k (16 prompts) | 1768.0 tok/s | 1786.5 | -1.04 % |
+| decode 256+256 (32 prompts) | 314.9 tok/s, TPOT 43.96 ms | 306.7, TPOT 44.52 ms | **+2.7 %** (TPOT -1.3 %) |
+
+The first off arm failed to start (health 000 — the orphaned-worker/VRAM trap
+again), so this is on-vs-off2 only, not a full A/B/A. Within that caveat the
+result matches c=1: **prefill parity within ~1 %, decode ~1-3 % in the gates'
+favour** (the first decode reading that is not obviously noise-dominated).
+
+c=8 TTFT is 35.7 s at 8k and 66.6-67.2 s at 16k (8 concurrent 16k prompts), and
+TPOT rises from ~11-12 ms at c=1 to ~44 ms at c=8.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
