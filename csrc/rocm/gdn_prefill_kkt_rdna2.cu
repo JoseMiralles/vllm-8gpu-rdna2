@@ -125,7 +125,12 @@ __global__ void __launch_bounds__(KKT_THREADS)
     const float beta_i = beta_r[l];
     const float g_i = g_r[l];
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
+// Partial unroll: the full 128-way unroll needs 253 VGPRs, i.e. one
+    // workgroup per CU (8 warps = 2 waves/SIMD) with 51 blocks queued behind
+    // it, so every LDS and global stall is exposed. 32 keeps the ILP the
+    // 4 accumulator chains need while dropping to 111 VGPRs, which fits two
+    // workgroups per CU.
+#pragma unroll 32
     for (int kk = 0; kk < KKT_K; ++kk) {
       // beta applied inside the dot exactly as the reference (b_kb = b_k *
       // beta[:, None]); the dot is fp32 x fp32 FMA.
