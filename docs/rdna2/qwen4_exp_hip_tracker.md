@@ -259,6 +259,50 @@ the remaining options are to build/instrument the GDN layer with
 `torch.cuda.Event` counters behind an env var, or to reason from a smaller
 input length.
 
+#### Round 10 — the residue is per-op Python dispatch, and it is now quantified
+
+`VLLM_GDN_PREFILL_TIMING=1` (commit 52bc48d82f) times each GDN prefill op in
+the live server with CUDA events. One 16k prefill, 400 calls/op, TP0:
+
+| arm | ops timed | total | per call |
+|---|---|---:|---:|
+| HIP | prep + kkt + solve_wy + delta_h + o | 524 ms | **1.31 ms** |
+| Triton | prep + chunk_gated_delta_rule | 627 ms | **1.57 ms** |
+
+**The HIP kernels are ~16 % faster per call in-server.** That overturns the
+"GDN ~-0.9 %" figure recorded in round 4, which was obtained by subtracting a
+QSA-only arm from a both-gates arm and never measured directly.
+
+Re-measured properly (standard shape, same session family):
+
+| arm | prefill 8k tok/s | prefill 16k tok/s |
+|---|---:|---:|
+| off (mean of 2) | 1728.8 | 1805.4 |
+| GDN only | 1705.7 (-1.3 %) | 1793.7 (-0.65 %) |
+| both | 1705.1 | 1793.4 |
+
+So **QSA contributes nothing to prefill and GDN accounts for all of it** — while
+its kernels are 0.26 ms/call *faster*, i.e. ~75 ms better per 16k forward. The
+~135-185 ms difference is **host-side Python dispatch**:
+
+* the HIP path makes **5 custom-op calls per chunk** (`gdn_prefill_prep_rdna2`
+  in the caller, then kkt, solve_wy, delta_h, o inside
+  `_gdn_prefill_chain_rdna2`), each with 12+ tensor arguments;
+* the Triton path makes **2** (`fused_post_conv_prep`, then
+  `chunk_gated_delta_rule`);
+* chunked prefill at 2048 gives 288 chunks per 16k forward, so that is ~1440
+  extra op dispatches per forward, and prefill is not cudagraphed here.
+
+**The fix (next action):** add one host-side C++ op that launches
+kkt -> solve_wy -> delta_h -> o in sequence and returns `(o, final_state)`,
+mirroring how `chunk_gated_delta_rule` presents the whole Triton chain as a
+single call. No kernel changes are needed — only a new host wrapper in
+`csrc/rocm/` (reuse the four existing wrappers' argument lists), its
+`ops.h` + `torch_bindings.cpp` entries, a `_custom_ops.py` wrapper, and
+replacing the four calls in `_gdn_prefill_chain_rdna2` with one. Expected to
+turn prefill from -0.65 % into roughly +0.2-0.5 % and finally make the gates a
+win.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
