@@ -332,6 +332,15 @@ what this box resolves for prefill (single-arm spread 0.4-0.9 %). **The gates
 are at parity within measurement resolution; there is no demonstrable win, and
 no remaining defect to point at.**
 
+One last hypothesis was that the gate changes the *compiled graph* around the
+GDN region (the arms compile different inductor graphs; the compile-log-line
+count matched, but that only counts graph breaks). The test was to run both arms
+with `--enforce-eager` and see whether the deficit vanished — **it could not be
+run: `--enforce-eager` kills this model during load** (the API log stops at
+10.5 KB with zero `VLLM::` processes). So the compiled-graph interaction remains
+untested, and is the one place left to look if someone wants to close the last
+~1 %.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
