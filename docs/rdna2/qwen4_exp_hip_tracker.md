@@ -328,15 +328,20 @@ Code: `csrc/rocm/gdn_prefill_delta_h_rdna2.cu` · Dispatcher:
 
   | kernel | Triton us | HIP us | delta | HIP at session start |
   |---|---:|---:|---:|---:|
-  | `kkt` | 462.3 | 884.6 | +91.3 % | 2413.9 (+422 %) |
-  | `o` | 3202.6 | 4136.0 | +29.1 % | 10484.9 (+228 %) |
-  | `solve_wy` | 2295.6 | 2785.2 | +21.3 % | 2775.0 |
-  | `delta_h` | 9106.2 | 7819.6 | **-14.1 %** | 11316.7 |
-  | chain (16k) | 14900.9 | 16178.7 | **+8.6 %** | 24188.1 (+62.5 %) |
+  | `prep` | 1365 | 1937 | +41.9 % | 4818 (+253 %) |
+  | `kkt` | 468 | 792 | +69.5 % | 2414 (+422 %) |
+  | `solve_wy` | 2289 | 2797 | +22.2 % | 2775 |
+  | `delta_h` | 9194 | 7839 | **-14.7 %** | 11317 |
+  | `o` | 3206 | 3900 | +21.7 % | 10485 (+228 %) |
+  | **all five** | 16522 | 17266 | **+4.5 %** | 29006 (+75 %) |
 
-  `o` alone was 7.3 ms of the 9.3 ms chain gap and `kkt` 2.0 ms; together they
-  are almost the whole regression. The remaining work is `kkt` (+91 %) and
-  `solve_wy` (+21 %).
+  (`chain` in the JSON is the four-kernel `_gdn_prefill_chain_rdna2`, which
+  starts from already-prepped inputs; `prep` runs once per token upstream of
+  it, and the "all five" row is the number that matches a serving prefill.)
+
+  The ordering was not what the earlier "unprofiled" note assumed: `o` and
+  `kkt` were the biggest *relative* offenders, but **`prep` was the biggest
+  absolute cost** and only showed up once the harness covered it.
 - [x] **perf fix 3/4 — LDS bank conflicts in `kkt` and `o`.** Both kernels
   stage fp16 tiles and then read them *column-wise* with one lane per column
   group. The natural row strides (K = 128 halves = 64 dwords, BT = 64 halves =
