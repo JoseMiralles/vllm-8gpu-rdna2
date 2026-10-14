@@ -152,6 +152,27 @@ forward. Prefill is **not** cudagraphed here (`cudagraph_capture_sizes` is
 pass `torch.empty`, or keep the buffers alive across calls. That targets the
 one mechanism the evidence actually points at.
 
+#### Round 5 — the decode "win" was measurement order
+
+Re-measuring the **gates-off** arm *after* the other arms, in the same session:
+
+| arm | measured | decode TPOT p50 ms |
+|---|---|---:|
+| off | 1st | 12.09 |
+| qsa only | 2nd | 11.28 |
+| both | 3rd | 11.58 |
+| **off (repeat)** | **4th** | **11.40** |
+
+The off arm alone spans 12.09 -> 11.40 ms, i.e. later arms read ~6 % faster on
+this box. Against the repeat control, qsa-only is -1.1 % and both is *worse*
+(+1.6 %). **There is no demonstrable decode win.** Every earlier "decode
++9.7 % / -9.7 %" number in this tracker was this order effect; the arms were
+always run off-first.
+
+Prefill, by contrast, is order-insensitive: the off arm read
+1735.6 / 1811.4 (1st) and 1721.7 / 1806.6 (4th), so the -1.5 to -1.9 % gates-on
+prefill cost is real.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
