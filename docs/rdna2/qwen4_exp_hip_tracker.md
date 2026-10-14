@@ -998,6 +998,51 @@ Code: `csrc/rocm/ple_short_conv_rdna2.cu` · Dispatcher:
 
 ---
 
+## TunableOp: decode/MTP grid built for this build (2026-10-14)
+
+Reading `tunableop/README.md` against the shipped profile exposed a real gap: the
+canonical `rocm7.14-rocblas5.5` profile carries "the M <= 8 decode shapes and the
+M = 16/24/32 MTP-verify shapes", but `rocm10-rocblas5.6` covered **only the
+prefill grid** (M = 800..8192) — so on this build every decode and MTP-verify
+GEMM was falling back to rocBLAS heuristics.
+
+Built with the README's recipe (service stopped, campaign in the sanctioned
+per-user location, never /tmp or the CWD):
+
+```
+tune_v620_fp16.py --output-root $HOME/.cache/tunableop/campaign-decode \
+  --batch-tokens 1 2 3 4 5 6 7 8 12 16 24 32
+qualify_v620_fp16.py $HOME/.cache/tunableop/campaign-decode/rocblas-d05939967b5f
+```
+
+* **84/84 keys produced, 84/84 passed on devices 0-3** against FP32 references.
+* Solver mix 81 `Gemm_Rocblas_*`, 3 `Default`.
+* **Per-shape speedup over the heuristic 1.4x to 3.6x**, largest on the K=320 and
+  K=10240 shapes (3.57x at M=16, n=10240, k=320).
+* Merged into the build's folder: 44 prefill + 84 decode/MTP = **128 rows/rank**,
+  key sets disjoint. **Lookup-hit proof 128/128, 0 misses**; coverage test passes.
+* The 84 rows are raw tuned, not curated (recorded in provenance).
+
+### Does it move serving? TunableOp on vs off, A/B/A, all arms health 200
+
+| shape | on | off | on (2nd) |
+|---|---:|---:|---:|
+| prefill 8k tok/s | 1716.8 | 1699.2 | 1713.2 |
+| prefill 16k tok/s | 1806.7 | 1789.0 | 1806.0 |
+| decode TPOT p50, 256 out | 11.20 ms | 11.36 | 11.57 |
+| decode TPOT p50, 512 out | 11.80 ms | 12.36 | 11.70 |
+
+**TunableOp as a whole is worth ~+0.95 % prefill.** Unlike the gate A/Bs this is
+above the noise: the two on-arms agree to 0.2 % and 0.04 %, and both beat the off
+arm on both shapes. Decode is parity-to-better (TPOT -4.9 % on the 512 shape).
+This compares TunableOp **on vs off**, so it measures both grids; isolating the 84
+new rows is a 44-row vs 128-row A/B/A, run separately.
+
+**Measurement lesson worth keeping:** this is what a resolvable effect looks like
+on this box — the same-config arms agree to <0.2 %, whereas the prefill gate A/Bs
+had ~1 % same-config spread. A ~1 % effect is only claimable when the arms are
+that tight, which is why the gate results stay "parity".
+
 ## Next actions (priority-ordered)
 
 1. **[blocking, highest value] Get a per-kernel view of the live server.**
