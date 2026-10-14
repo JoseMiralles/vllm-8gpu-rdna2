@@ -222,6 +222,32 @@ to decide whether a sub-1 % prefill cost with no decode benefit justifies the
 path at all, or to find the remaining cost with in-server profiling (which
 `rocprofv3 --attach` cannot do here — see the gotcha below).
 
+#### Round 8 — the residue is real (~1.2 %) but not attributable offline
+
+Pooling every 16k prefill reading taken on the fixed build, the gates-off arm
+gives 1806.2 / 1804.5 / 1811.4 / 1801.2 / 1816.0 / 1806.6 tok/s (mean 1807.6,
++/-0.5 %) and the gates-on arm 1783.7 / 1793.4 / 1781.5 (mean 1786.2), so the
+~-1.2 % is outside the off-arm spread. It is real and it is not noise.
+
+It is also **not explainable by anything measured offline**, which is the
+unsolved part: at the production chunk size every component is *faster* on HIP
+(GDN five-kernel sum -23.9 %, whole chain per-call sync -5.6 %, dense
+`mqa_paged` -10 %), which should make prefill ~150 ms *faster*, not ~100 ms
+slower. Roughly 250 ms is unaccounted for.
+
+Ruled out this round, with evidence:
+- **Inductor recompiles / graph breaks**: both arms log 3 compile-related
+  lines; no difference.
+- **Chunk metadata build**: `gdn_attn.py:_build_chunk_metadata` runs for every
+  prefill batch regardless of the gate, so both arms pay it.
+- **In-server torch profiling**: `--profiler-config.profiler=torch` plus the
+  `/start_profile` `/stop_profile` router works far enough to write the
+  API-side trace, but the **worker** traces never flush — "Stopping profiler..."
+  was logged and then nothing for 3 minutes, and only
+  `*.async_llm.*.pt.trace.json.gz` (CPU `python_function` events only) appeared.
+  `rocprofv3 --attach` is also unusable here. **This box cannot currently give a
+  per-kernel view of a live server**, which is what the last 250 ms needs.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
