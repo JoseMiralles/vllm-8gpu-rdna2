@@ -105,16 +105,19 @@ real, down from -4.4 % before this work**.
 - **Not QSA.** At prefill row counts (kernel time, GPU 1) `store_cache_rows` is
   -25 % at 2048 rows and -58 % at 8192, and `compress_groups` is +14.5 % /
   +9.4 %, so QSA is a small net *win* during prefill.
-- **Leading remaining suspect: the `torch.zeros` intermediates.**
-  `_gdn_prefill_chain_rdna2` allocates `A`, `A_inv`, `w`, `u`, `h`, `v_new`
-  and `final_state` with `torch.zeros` (deliberate: "cudagraph capture bakes
-  tensor addresses; uncommitted pages fault on replay"), and
-  `qwen_gdn_linear_attn.py:1821` zeroes q/k/v/g/beta on top. At 16k that is
-  ~250 MB of memset per GDN layer per forward, ~0.5 ms x 36 layers = ~18 ms
-  measured against the ~154 ms still unexplained. The Triton path does not pay
-  the same allocations. **Next thing to measure**: time
-  `_gdn_prefill_chain_rdna2` against the sum of its five kernels with buffers
-  preallocated, which isolates the allocator from the kernels.
+- **Not the `torch.zeros` intermediates (measured, refuted).** The HIP path does
+  zero more than Triton: `_gdn_prefill_chain_rdna2` allocates `A`, `A_inv`,
+  `w`, `u`, `h`, `v_new`, `final_state` with `torch.zeros` (deliberate --
+  "cudagraph capture bakes tensor addresses; uncommitted pages fault on
+  replay") and `qwen_gdn_linear_attn.py:1821` zeroes q/k/v/g/beta on top, so
+  ~385 MB of memset per GDN layer per forward at 16k. But the chain bench
+  measures it directly: `_gdn_prefill_chain_rdna2` at 16k is 15882 us and the
+  same four kernels with buffers preallocated sum to 15328 us, so the whole
+  allocator costs **554 us per layer = ~20 ms per forward**, not the ~134 ms
+  still unexplained.
+- **What is left is unattributed.** The next step is not another guess: run the
+  server under `rocprofv3 --kernel-trace` for one 16k prefill on each arm and
+  diff the per-kernel totals, which will name the missing cost directly.
 
 ### Re-run after the LDS-staged delta_h
 
