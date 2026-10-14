@@ -528,21 +528,37 @@ __global__ void qsa_mqa_paged_kernel(
     // Dense contiguous rows: two MACs per instruction via v_dot2. The indexer
     // layout is [rows, heads, head_dim] contiguous with head_dim even, so this
     // is the production path; anything else falls back to scalar half loads.
+    // The dense path takes 128 bits at a time and keeps four independent
+    // fdot2 accumulator chains. The previous form issued one 4-byte load per
+    // f16x2 operand (512 loads per column per row) and accumulated all 64
+    // fdot2 of a head into a single register, so the dot was a 64-deep
+    // dependent chain. That is why HIP lost to Triton once most columns were
+    // visible: the early-chunk win came only from skipping masked columns, and
+    // the dense case was simply a worse kernel.
     const bool dense = (stride_q_dim == 1) && (stride_cache_dim == 1)
-        && (stride_q_head % 2 == 0) && (stride_cache_token % 2 == 0)
-        && (head_dim % 2 == 0)
+        && (stride_q_head % 8 == 0) && (stride_cache_token % 8 == 0)
+        && (head_dim % 8 == 0)
         && ((reinterpret_cast<uintptr_t>(k_row)
-             | reinterpret_cast<uintptr_t>(q_row)) % 4 == 0);
+             | reinterpret_cast<uintptr_t>(q_row)) % 16 == 0);
     for (int h = 0; h < num_heads; ++h) {
       const half* q_head = q_row + (int64_t)h * stride_q_head;
       float dot = 0.0f;
       if (dense) {
-        const f16x2* q_vec = reinterpret_cast<const f16x2*>(q_head);
-        const f16x2* k_vec = reinterpret_cast<const f16x2*>(k_row);
-#pragma unroll 4
-        for (int d2 = 0; d2 < head_dim / 2; ++d2) {
-          dot = __builtin_amdgcn_fdot2(q_vec[d2], k_vec[d2], dot, false);
+        const uint4* q_vec = reinterpret_cast<const uint4*>(q_head);
+        const uint4* k_vec = reinterpret_cast<const uint4*>(k_row);
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int d8 = 0; d8 < head_dim / 8; ++d8) {
+          const uint4 qq = q_vec[d8];
+          const uint4 kk = k_vec[d8];
+          const f16x2* qh = reinterpret_cast<const f16x2*>(&qq);
+          const f16x2* kh = reinterpret_cast<const f16x2*>(&kk);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            acc[j] = __builtin_amdgcn_fdot2(qh[j], kh[j], acc[j], false);
+          }
         }
+        dot = (acc[0] + acc[1]) + (acc[2] + acc[3]);
       } else {
         for (int d = 0; d < head_dim; ++d) {
           dot += __half2float(q_head[(int64_t)d * stride_q_dim])
