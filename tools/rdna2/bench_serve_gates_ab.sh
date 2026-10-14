@@ -38,6 +38,12 @@ run() { # name input_len output_len prompts concurrency
   grep -E "TTFT \(ms\)|TPOT \(ms\)|token throughput" "$out/$1.log"
 }
 
-run prefill_8k 8192 1 16 1
-run prefill_16k 16384 1 8 1
-run decode_256 128 256 8 1
+# The served prefill chunks are 1024/2048 (--max-num-batched-tokens 2048); the
+# 8k/16k shapes are the long-context chunked-prefill sizes the PR also quotes.
+run prefill_1k_c1 1024 1 64 1
+run prefill_1k_c8 1024 1 64 8
+run prefill_8k_c1 8192 1 16 1
+run prefill_8k_c8 8192 1 16 8
+run prefill_16k_c1 16384 1 8 1
+run prefill_16k_c8 16384 1 8 8
+run decode_c1 128 256 8 1
