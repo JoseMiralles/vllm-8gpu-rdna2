@@ -666,27 +666,37 @@ Code: `csrc/rocm/ple_short_conv_rdna2.cu` · Dispatcher:
 
 ## Next actions (priority-ordered)
 
-1. **[S5 bench, highest value]** The four unprofiled GDN prefill kernels are
-   now profiled (`tools/rdna2/bench_gdn_prefill_chain_rdna2.py`) and the chain
-   is down from +62.5 % to +8.6 % at 16k. Finish it: `kkt` is still +91 % and
-   `solve_wy` +21 %. Both need the LDS lane-stride treatment (see the GDN
-   section) and `kkt` can likely use V_DOT2 now that both dot operands are
-   fp16. Then re-run the serving A/B.
-2. **[S5 bench]** Find what makes `VLLM_RDNA_QSA_HIP=1` worth ~9.7 % decode
-   TPOT. The rows=512 `mqa_paged` win does not occur at decode row counts, so
-   the cause is something else in the QSA decode path — profile a decode step
-   with the gate on/off rather than guessing from the op benches.
-3. **[S5 bench]** `compress_groups` is 25.6 % slower than Triton at the kernel
-   level and nobody has looked at why.
+1. **[blocking, highest value] Get a per-kernel view of the live server.**
+   Everything else is blocked on this. Pooled 16k prefill on the fixed build
+   reads off 1807.6 +/-0.5 % vs on 1786.2 tok/s, so the ~-1.2 % residue is
+   real; but every offline component is *faster* on HIP at the production chunk
+   size (GDN five-kernel sum -23.9 %, whole chain per-call sync -5.6 %, dense
+   `mqa_paged` -10 %), which should make prefill ~60 ms faster, not ~108 ms
+   slower. ~170 ms is unaccounted for.
+   Both profiling routes on this box are dead: `rocprofv3 --attach` needs a
+   `rocp-bg-attach` thread the runtime does not create (and `ROCP_TOOL_ATTACH=1`
+   did not help), and vLLM's `/start_profile` router writes only the API-side
+   CPU trace — the worker traces never flush. Options not yet tried: launch the
+   server **under** `rocprofv3` in application mode and filter the trace by
+   timestamp; or `rocprof-sys-run`/`rocprof-compute`; or instrument the GDN
+   layer with `torch.cuda.Event` counters behind an env var and read them from
+   the log.
+2. **[S5 bench]** `compress_groups` is 25.6 % slower than Triton at rows=512
+   (+14.5 % at rows=2048, +9.4 % at rows=8192) and nobody has looked at why.
+   It is small in absolute terms but it is the only QSA op still behind.
+3. **[S5 bench]** `kkt` +70 % and `solve_wy` +22 % at 16k remain (both are at
+   or better than Triton at T=2048, so they do not affect serving today).
+   `solve_wy` is LDS-bound at 59392 B -> 1 workgroup/CU.
 4. **[S3]** Re-run the serving A/B at higher concurrency and with prefix-cache
-   hits; the numbers here are concurrency-1 and zero-cache.
-5. **[S6 default-on]** `VLLM_RDNA_QSA_HIP` is the only gate with a measured
-   win (decode). `VLLM_GDN_HIP_PREFILL` is a measured 5.5 % prefill loss —
-   leave both at "0" until items 1 and 2 land.
-6. **[env]** The `TUNABLEOP_PROFILE=rocm10-rocblas5.6` pin in the production
-   launcher now hard-fails (loaded rocBLAS hashes to `d05939967b5f`). Either
-   re-register the new build's profile or drop the pin; production currently
-   only starts with `TUNABLEOP_PROFILE=`.
+   hits; every number here is concurrency-1 and zero-cache.
+5. **[S6 default-on]** Both gates stay "0". The gates are a ~1.2 % prefill
+   cost with no measurable decode benefit; there is no clean win to flip on.
+   Note the PR's own exit criterion is "flip defaults only on a clean win".
+6. **[env]** The `TUNABLEOP_PROFILE=rocm10-rocblas5.6` pin is now **fixed**
+   (commit 040b4afeb1 re-registered it against the loaded build `d05939967b5f`;
+   44/44 lookup hits). No action. The untracked legacy
+   `tunableop/rocblas-d05939967b5f/` directory is still on disk; harmless
+   (registered profiles win auto-select) but the storage policy says drop it.
 
 ---
 
