@@ -164,11 +164,31 @@ def qsa_expand_indices(
     )
 
 
+def qsa_sparse_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse GQA attention over paged K/V (mirrors the Triton entry point).
+
+    Split-K with fp32 partials merged by log-sum-exp; returns ``out``
+    (``[rows, heads, head_dim]`` in ``q``'s dtype).
+    """
+    return ops.qsa_sparse_paged_attention_rdna2(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+    )
+
+
 __all__ = [
     "qsa_compress_groups",
     "qsa_compress_groups_with_ratio_compat",
     "qsa_expand_indices",
     "qsa_mqa_paged",
+    "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",
     "qsa_store_cache_rows_compat",
     "qsa_use_rdna2",

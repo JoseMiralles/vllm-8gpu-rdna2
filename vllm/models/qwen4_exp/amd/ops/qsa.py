@@ -947,6 +947,10 @@ def qsa_sparse_paged_attention(
     assert out.stride(2) == 1
     if not q.shape[0]:
         return out
+    if qsa_rdna2.qsa_use_rdna2(q.dtype):
+        return qsa_rdna2.qsa_sparse_paged_attention(
+            q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        )
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)

@@ -10,6 +10,8 @@ reference kernels in ``vllm/models/qwen4_exp/amd/ops/qsa.py``:
 - ``qsa_compress_groups_rdna2``    vs ``_compress_qsa_groups_kernel``
 - ``qsa_mqa_paged_rdna2``          vs ``_qsa_mqa_paged_kernel``
 - ``qsa_expand_indices_rdna2``      vs ``_expand_qsa_indices_kernel``
+- ``qsa_sparse_paged_attention_rdna2`` vs ``_qsa_sparse_paged_gqa_splitk_kernel``
+  + ``_qsa_merge_splitk_kernel``
 
 The HIP path is opt-in (``VLLM_RDNA_QSA_HIP=1``); these tests call the HIP
 wrappers directly and pin the Triton side off with a monkeypatched gate, so
@@ -53,6 +55,7 @@ HIP_QSA_OPS = [
     "_rocm_C::qsa_compress_groups_rdna2",
     "_rocm_C::qsa_mqa_paged_rdna2",
     "_rocm_C::qsa_expand_indices_rdna2",
+    "_rocm_C::qsa_sparse_paged_attention_rdna2",
 ]
 
 
@@ -825,3 +828,115 @@ def test_expand_indices_routes_to_hip_behind_the_gate(monkeypatch):
     )
     assert seen == [], "the gate must keep int32 on Triton"
     assert ref.dtype == torch.int32
+
+
+# --- sparse paged attention vs the splitk + merge Triton pair ----------------
+
+
+def _sparse_inputs(
+    rows, heads, kv_heads, head_dim, topk, page_size, num_pages, num_requests,
+    seed=0,
+):
+    """Paged K/V plus an index selection for the sparse attention.
+
+    Logical token ids are constrained so that their logical page is inside the
+    block table's width (otherwise everything would be masked), and a sentinel
+    -1 is planted to exercise the invalid-index path.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    table_width = max(1, num_pages // num_requests)
+    q = (torch.randn(rows, heads, head_dim, device=device, generator=gen) * 0.5).half()
+    k_cache = torch.randn(
+        num_pages, page_size, kv_heads, head_dim, device=device, generator=gen
+    ).half()
+    v_cache = torch.randn(
+        num_pages, page_size, kv_heads, head_dim, device=device, generator=gen
+    ).half()
+    block_table = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    ).reshape(num_requests, table_width)
+    token_to_req = torch.randint(
+        0, num_requests, (rows,), dtype=torch.int32, device=device, generator=gen
+    )
+    if rows:
+        token_to_req[0] = -1  # invalid request -> fully masked row
+    logical = torch.randint(
+        0, table_width * page_size, (rows, topk), dtype=torch.int32,
+        device=device, generator=gen,
+    )
+    if topk > 1:
+        logical[:, -1] = -1
+    return q, k_cache, v_cache, logical, block_table, token_to_req
+
+
+# Heads 4 / kv 1 and heads 2 / kv 2 are the GQA shapes the model uses; topk
+# 8 forces num_tiles == 1 (the single-split path that writes straight to fp16)
+# while 64 forces multi-split partials through the merge kernel.
+@pytest.mark.parametrize("heads,kv_heads", [(4, 1), (2, 2)])
+@pytest.mark.parametrize("topk", [8, 64, 129])
+@pytest.mark.parametrize("rows", [1, 7, 40])
+def test_sparse_paged_attention_parity(triton_gate, heads, kv_heads, topk, rows):
+    """HIP sparse attention must match the Triton splitk + merge pair."""
+    page_size, num_pages, num_requests, head_dim = 16, 64, 4, 128
+    q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
+        rows, heads, kv_heads, head_dim, topk, page_size, num_pages, num_requests,
+        seed=rows * 7 + topk,
+    )
+    ref = qsa_ops.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical, block_table, token_to_req
+    )
+    hip = qsa_rdna2.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical, block_table, token_to_req
+    )
+    assert hip.shape == ref.shape == q.shape
+    assert hip.dtype == ref.dtype == torch.float16
+    # The single-split path is bit-exact against Triton; with splits, the only
+    # difference is the merge summing the partials in a different order, which
+    # lands within 1-2 fp16 ulps (measured: <=6e-5 abs, ~1e-3 rel at |ref|~0.5).
+    # Bound it tightly so a real error cannot hide.
+    torch.testing.assert_close(hip.float(), ref.float(), rtol=5e-3, atol=1e-4)
+
+
+def test_sparse_paged_attention_fully_masked_rows_are_zero():
+    """A row whose request is invalid must come out as zeros, not NaN."""
+    rows, heads, kv_heads, head_dim, topk = 3, 4, 1, 128, 32
+    q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
+        rows, heads, kv_heads, head_dim, topk, 16, 64, 4, seed=5
+    )
+    token_to_req[:] = -1
+    hip = qsa_rdna2.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical, block_table, token_to_req
+    )
+    assert torch.equal(hip, torch.zeros_like(hip)), "masked rows must be 0"
+    assert not torch.isnan(hip.float()).any()
+
+
+def test_sparse_paged_attention_out_param_is_in_place():
+    rows, heads, kv_heads, head_dim, topk = 4, 4, 1, 128, 48
+    q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
+        rows, heads, kv_heads, head_dim, topk, 16, 64, 4, seed=9
+    )
+    buf = torch.zeros_like(q)
+    got = qsa_rdna2.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical, block_table, token_to_req, out=buf
+    )
+    assert got.data_ptr() == buf.data_ptr()
+
+
+def test_sparse_paged_attention_routes_to_hip_only_for_fp16(monkeypatch):
+    """fp16 goes to the HIP op; bf16 must keep Triton (the kernels are fp16)."""
+    seen: list[torch.dtype] = []
+    monkeypatch.setattr(
+        qsa_rdna2,
+        "qsa_sparse_paged_attention",
+        lambda *a, **kw: seen.append(a[0].dtype) or torch.empty(0),
+    )
+    monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", True)
+    monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
+    q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
+        4, 4, 1, 128, 32, 16, 64, 4, seed=13
+    )
+    qsa_ops.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical, block_table, token_to_req
+    )
+    assert seen == [torch.float16]

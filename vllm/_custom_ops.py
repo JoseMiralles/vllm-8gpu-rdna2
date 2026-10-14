@@ -792,6 +792,26 @@ def qsa_compress_groups_rdna2(
     )
 
 
+def qsa_sparse_paged_attention_rdna2(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.qsa_sparse_paged_attention_rdna2(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out,
+    )
+
+
 def qsa_expand_indices_rdna2(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,

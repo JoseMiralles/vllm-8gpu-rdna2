@@ -685,6 +685,15 @@ void qsa_compress_groups_rdna2(
     const at::Tensor& head_dim,
     bool load_rope_positions);
 
+torch::Tensor qsa_sparse_paged_attention_rdna2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    c10::optional<at::Tensor> out);
+
 torch::Tensor qsa_expand_indices_rdna2(
     const at::Tensor& block_indices,
     const at::Tensor& query_positions,
