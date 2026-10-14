@@ -341,6 +341,15 @@ run: `--enforce-eager` kills this model during load** (the API log stops at
 untested, and is the one place left to look if someone wants to close the last
 ~1 %.
 
+**Try `-O0` / `--compilation-config.mode=0` instead of `--enforce-eager`.** Both
+disable the inductor graph, but `--enforce-eager` aborts this model at load
+while the compilation-mode knob is the supported way to do it (and prefill is
+not cudagraphed here anyway, so losing cudagraphs does not invalidate the
+prefill comparison). Run both gate settings with it and see whether the ~1 %
+GDN deficit disappears; if it does, the cause is the compiled graph around the
+GDN region and not the kernels, which every isolated measurement already says
+are faster.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
