@@ -76,6 +76,46 @@ Caveat: the repo's own notes record ~10 % session-to-session drift on these
 serving numbers, so only the within-session A/B above is meaningful, and it is
 one workload (concurrency 1, no prefix-cache hits).
 
+### Final A/B on the fully-fixed build
+
+Same-session, back-to-back, one fresh server process per arm:
+
+| metric | off | on | delta |
+|---|---:|---:|---:|
+| prefill 8k, total tok/s | 1728.0 | 1698.1 | -1.7 % |
+| prefill 16k, total tok/s | 1816.0 | 1781.5 | -1.9 % |
+| prefill 16k, TTFT p50 ms | 9535.2 | 9726.0 | +2.0 % |
+| decode 128+256, TPOT p50 ms | 10.78 | 11.83 | +9.7 % (worse) |
+
+**The decode row is not usable.** Across the four sessions measured here the
+*same* gates-on config gave TPOT 10.67, 11.25 and 11.83 ms while the gates-off
+arm gave 11.83, 11.69 and 10.78 ms — the sign of the delta flips between
+sessions, so decode is inside this box's ~10 % drift band and no decode claim
+should be made from it.
+
+Prefill, by contrast, is stable: the off arm has read 1809.6 / 1801.2 / 1806.8
+/ 1812.0 / 1816.0 tok/s across five sessions (±0.4 %), and the on arm has
+climbed 1705.7 -> 1773.0 -> 1781.5 as the kernels were fixed. So **-1.9 % is
+real, down from -4.4 % before this work**.
+
+#### What the remaining -1.9 % is not
+
+- **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
+  i.e. 744 us per layer x 36 layers = 27 ms of a 9535 ms prefill = 0.28 %.
+- **Not QSA.** At prefill row counts (kernel time, GPU 1) `store_cache_rows` is
+  -25 % at 2048 rows and -58 % at 8192, and `compress_groups` is +14.5 % /
+  +9.4 %, so QSA is a small net *win* during prefill.
+- **Leading remaining suspect: the `torch.zeros` intermediates.**
+  `_gdn_prefill_chain_rdna2` allocates `A`, `A_inv`, `w`, `u`, `h`, `v_new`
+  and `final_state` with `torch.zeros` (deliberate: "cudagraph capture bakes
+  tensor addresses; uncommitted pages fault on replay"), and
+  `qwen_gdn_linear_attn.py:1821` zeroes q/k/v/g/beta on top. At 16k that is
+  ~250 MB of memset per GDN layer per forward, ~0.5 ms x 36 layers = ~18 ms
+  measured against the ~154 ms still unexplained. The Triton path does not pay
+  the same allocations. **Next thing to measure**: time
+  `_gdn_prefill_chain_rdna2` against the sum of its five kernels with buffers
+  preallocated, which isolates the allocator from the kernels.
+
 ### Re-run after the LDS-staged delta_h
 
 Two arms only (QSA is unaffected by that change), same harness and workload:
