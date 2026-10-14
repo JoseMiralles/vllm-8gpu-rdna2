@@ -1144,6 +1144,44 @@ the split partitioning all differ; carry over the softmax/split/partial layout a
 the RDNA2 idioms, and rewrite the traversal. Budget this as a real kernel, not an
 edit.
 
+### Design note for the splitk port (worked out, not yet written)
+
+**Geometry.** `GROUP_SIZE = NUM_QUERY_HEADS / num_kv_heads`, which in the model is
+`indexer_n_heads 4 / indexer_kv_heads 1 = 4`, so `BLOCK_M = next_pow2(4) = 4`.
+`HEAD_DIM = 128`. `BLOCK_N` is 16 or 64 from the host profile, and
+`num_tiles = cdiv(TOPK, BLOCK_N)`, `num_splits = min(1 << (num_tiles.bit_length()-1),
+target_splits)` — i.e. the largest power of two that does not exceed the tile
+count. Grid is `(rows, num_kv_heads, num_splits)`. When `num_splits == 1` the
+kernel writes the normalised output straight into `out` (fp16); otherwise it
+writes fp32 partials `[num_splits, rows, H_q, HEAD_DIM]` and
+`[num_splits, rows, H_q]`.
+
+**Thread mapping that fits RDNA2.** The group is only 4 query heads against 128
+dimensions, so the natural shape is 128 threads = 4 warps, **one warp per query
+head**, with each lane owning `BLOCK_N / 32` columns and computing those columns'
+full 128-dim score dot itself (no cross-lane reduction for the scores — at
+`BLOCK_N = 64` that is 2 columns × 64 `fdot2` per lane). The per-row softmax max
+and sum are then a `shfl_xor` reduction **within** the warp, which keeps it cheap
+and avoids LDS round-trips. For the `P @ V` accumulation give each lane 4 output
+dimensions and loop the columns, broadcasting `p[c]` through LDS.
+
+**Both dots can use `fdot2`, but they need opposite K/V layouts.** The score dot
+pairs over `HEAD_DIM`, so k must be token-major with dim contiguous — which is
+exactly how the paged cache already stores it. The accumulation pairs over the
+*column* (`t`), so it needs `(v[c, d], v[c+1, d])` as a `half2`, i.e. v staged
+**transposed** as `[HEAD_DIM, BLOCK_N]`. That is the same trick
+`gdn_lds_load_v_transposed` already uses in `gdn_prefill_o_rdna2.cu` — reuse it
+rather than inventing a layout. Stage both tiles in LDS: every K/V value is
+reused `GROUP_SIZE` times (once per query head in the group), which is what pays
+for the gather. Budget ~34 KB LDS at `HEAD_DIM=128, BLOCK_N=64`
+(k 16 KB + v-transposed 16 KB + q 1 KB + p 1 KB), and remember the padded-stride
+rule from the bank-conflict lesson above when laying them out.
+
+**Numerics.** Base-2 online softmax (`exp2f`), accumulate and partials in fp32,
+and the merge divides by the summed weights — same as Triton. The merge's
+reduction order will differ from Triton's `tl.sum` tree, so its test tolerance
+should be fp16-ulp scaled like the GDN chain tests, not flat.
+
 ### To implement
 
 Port the three kernels into `csrc/rocm/qsa_rdna2.cu`, following exactly the
