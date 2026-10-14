@@ -83,7 +83,7 @@ constexpr int GDN_LDS_H_BYTES = GDN_BV * GDN_QS * 2;  //  8320 (s_h [BV,K] fp16)
 constexpr int GDN_LDS_V_BYTES =
     GDN_BV * GDN_VS * 2;                  //  4224 (s_v_T [BV,BT] fp16)
 constexpr int GDN_LDS_G_FLOATS = GDN_BT;  // 64 * 4 = 256 bytes
-constexpr int GDN_LDS_BA_BYTES = GDN_BT * GDN_BT * 4;  // 16384 (s_bA fp32)
+constexpr int GDN_LDS_BA_BYTES = GDN_BT * GDN_BT * 2;  //  8192 (s_bA fp16)
 // s_bA gets its own slot. It MUST NOT alias s_q: the compiler cannot see that
 // the __half* s_q and float* s_bA views of the extern LDS buffer overlap, and
 // the resulting alias-analysis failure makes the s_q reads of the q @ h^T dot
@@ -194,7 +194,7 @@ __device__ __forceinline__ void gdn_lds_load_v_transposed(
 // major. Each thread writes 16 fp32 = 64 bytes; the full grid writes
 // the entire [BT, BT] tile (4096 fp32 = 16 KB).
 __device__ __forceinline__ void gdn_store_bA_to_lds(
-    float* dst,  // s_bA[BT * BT] fp32 row-major
+    __half* dst,  // s_bA[BT * BT] fp16 row-major
     const float bA[GDN_AROW][GDN_ACOL], int rb, int cb) {
   constexpr int COLS_TOTAL = GDN_BT;
 #pragma unroll
@@ -203,7 +203,7 @@ __device__ __forceinline__ void gdn_store_bA_to_lds(
     for (int dc = 0; dc < GDN_ACOL; ++dc) {
       const int r = rb * GDN_AROW + dr;
       const int c = cb * GDN_ACOL + dc;
-      dst[(long)r * COLS_TOTAL + c] = bA[dr][dc];
+      dst[(long)r * COLS_TOTAL + c] = __float2half_rn(bA[dr][dc]);
     }
   }
 }
@@ -283,10 +283,12 @@ gdn_prefill_o_rdna2_kernel(
       reinterpret_cast<float*>(smem + (GDN_LDS_Q_BYTES + GDN_LDS_K_BYTES +
                                        GDN_LDS_H_BYTES + GDN_LDS_V_BYTES) /
                                           2);    // [BT] fp32 (per-row)
-  float* s_bA = reinterpret_cast<float*>(
-      smem + (GDN_LDS_Q_BYTES + GDN_LDS_K_BYTES + GDN_LDS_H_BYTES +
-              GDN_LDS_V_BYTES + GDN_LDS_G_FLOATS * (int)sizeof(float)) /
-                  2);  // [BT, BT] fp32
+  // s_bA holds the gated/masked b_A already rounded to fp16: that is exactly
+  // what the final dot consumes, so storing it fp32 only bought 256
+  // __float2half_rn per thread in dot 3 plus 8 KB of LDS.
+  __half* s_bA = smem + (GDN_LDS_Q_BYTES + GDN_LDS_K_BYTES + GDN_LDS_H_BYTES +
+                         GDN_LDS_V_BYTES + GDN_LDS_G_FLOATS * (int)sizeof(float)) /
+                            2;  // [BT, BT] fp16
   // Per-thread sub-block accumulators.
   float bA[GDN_AROW][GDN_ACOL];
 #pragma unroll
@@ -476,8 +478,7 @@ gdn_prefill_o_rdna2_kernel(
 #pragma unroll
         for (int dr = 0; dr < GDN_AROW; ++dr) {
           const long bA_off = (long)(rb * GDN_AROW + dr) * GDN_BT + cp * 2;
-          bA_pair[dr] = __halves2half2(__float2half_rn(s_bA[bA_off]),
-                                       __float2half_rn(s_bA[bA_off + 1]));
+          bA_pair[dr] = *reinterpret_cast<const half2*>(&s_bA[bA_off]);
         }
 #pragma unroll
         for (int dr = 0; dr < GDN_AROW; ++dr) {
