@@ -1066,6 +1066,60 @@ The swap restores the tracked CSVs and verifies the sha256 against the committed
 128-row files; it printed "restored to the committed 128-row version" and
 `git status` shows no modification.
 
+## Requirement: QSA must be fully HIP (no Triton) — spec, not yet implemented
+
+With both gates on, the QSA path still executes **three Triton kernels** because
+`qsa_rdna2.py` implements only store/compress/mqa. Confirmed by reading every
+dispatch site in `vllm/models/qwen4_exp/amd/ops/qsa.py`:
+
+| Triton kernel | lines | launched from | gate |
+|---|---:|---|:--:|
+| `_expand_qsa_indices_kernel` | 71 | `qsa_select_paged_tokens` (qsa.py:790) | none |
+| `_qsa_sparse_paged_gqa_splitk_kernel` | 169 | `qsa_sparse_paged_attention` (qsa.py:892, launches at :988) | none |
+| `_qsa_merge_splitk_kernel` | 44 | same, launch at :1029 | none |
+
+`qsa_sparse_paged_attention` is called **unconditionally** from
+`vllm/models/qwen4_exp/amd/qsa.py:193`, and its host side (~70 lines) picks a
+block/split profile by size, including an explicit small-M path
+(`small_profile_limit = 8 if block_m <= 8 else 4`) — so it runs in decode as well
+as prefill. **The claim in `qwen4_exp_hip_path.md` that this "only fires at
+prefill (large M)" is wrong and should be corrected.**
+
+### To implement
+
+Port the three kernels into `csrc/rocm/qsa_rdna2.cu`, following exactly the
+pattern already landed for `qsa_mqa_paged_rdna2` (that port is the template —
+same file, same binding style):
+
+1. Kernels in `csrc/rocm/qsa_rdna2.cu` (keep the Triton signatures' semantics:
+   `logical_indices`/`block_table` are int32, q/k/v fp16, GQA grouping
+   `q.shape[1] % k_cache.shape[2] == 0`, `head_dim >= 16 and power of two`).
+2. Declarations in `csrc/rocm/ops.h` (the three new host wrappers).
+3. `TORCH_LIBRARY_EXPAND` schema entries in `csrc/rocm/torch_bindings.cpp`.
+4. `_custom_ops.py` wrappers.
+5. `qsa_rdna2.py` dispatchers + `qsa.py` call-site gates, using
+   `qsa_use_rdna2(dtype)` so bf16 keeps Triton (the HIP kernels are fp16-only).
+6. Tests: extend `tests/kernels/rocm/qwen4_exp/test_qsa_rdna2.py` with parity for
+   all three (the file already has `_mqa_inputs`-style builders and the
+   `test_dispatched_*_match_gate_off` pattern), and add an end-to-end
+   `qsa_select_paged_tokens` / `qsa_sparse_paged_attention` gate-vs-off check.
+7. Rebuild: `ninja -C build _rocm_C.abi3.so` (~35 s), install atomically
+   (`cp ... .so.new && mv`), run the QSA suite (193 cases today).
+
+### Why this is the highest-value remaining item
+
+The sparse attention is the *actual attention computation* — the indexer the
+gates currently switch only selects tokens. So this is the only QSA change likely
+to move serving, and it is the difference between "both gates on" and "no Triton
+in QSA". It is also the only way to answer the coverage question the user asked
+("all HIP, no Triton") affirmatively.
+
+### Not part of this: other gates
+
+`VLLM_RDNA_HC_PREFILL_HIP` and `VLLM_RDNA_PLE_CONV_HIP` are separate opt-ins for
+other Triton paths; "both flags on" never covered them and this item is scoped to
+QSA only.
+
 ## Next actions (priority-ordered)
 
 1. **[blocking, highest value] Get a per-kernel view of the live server.**
