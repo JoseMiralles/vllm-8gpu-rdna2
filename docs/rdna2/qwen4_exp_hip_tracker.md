@@ -1085,6 +1085,59 @@ block/split profile by size, including an explicit small-M path
 as prefill. **The claim in `qwen4_exp_hip_path.md` that this "only fires at
 prefill (large M)" is wrong and should be corrected.**
 
+### Status
+
+- **[x] `_expand_qsa_indices_kernel` — PORTED** (commit 221782e69d).
+  `qsa_expand_indices_rdna2` in `csrc/rocm/qsa_rdna2.cu`, gated in
+  `expand_qsa_block_indices_cuda`. One thread per output element
+  (`[rows, token_topk + compress_ratio - 1]` int32), both strides honoured, the
+  `block_indices` load guarded exactly like Triton's masked load so a zero
+  `block_topk` never reads. **53 new test cases, bit-exact vs Triton**
+  (ratio x block_topk x rows incl. `block_topk=0`, empty rows, `out=` in place,
+  a non-unit column stride, and gate routing); QSA suite **193 -> 246 passed**.
+  **Gate trap worth keeping:** this is an integer op, so use the plain
+  `qsa_use_rdna2()`; `qsa_use_rdna2(dtype)` requires fp16 and silently disabled
+  the HIP path.
+- **[ ] `_qsa_sparse_paged_gqa_splitk_kernel` + `_qsa_merge_splitk_kernel`** — not
+  started. This is the real work: flash-attention class.
+
+### Contracts for the remaining two
+
+**splitk** — grid `(num_rows, num_kv_heads, NUM_SPLITS)`, `BLOCK_M =
+next_pow2(GROUP_SIZE)` where `GROUP_SIZE = NUM_QUERY_HEADS / num_kv_heads`.
+Query block is `q[row, kv_head*GROUP_SIZE + 0..BLOCK_M, 0..HEAD_DIM]` masked to
+`GROUP_SIZE`. Tiles are assigned by dynamic bounds:
+`split_tile_start = split_id * NUM_TILES // NUM_SPLITS` (so splits are uneven and
+unpadded). Per tile of `BLOCK_N` columns: `logical_token =
+indices[row, tile*BLOCK_N + arange(BLOCK_N)]` (masked `columns < TOPK`, else -1);
+`safe = max(logical,0)`; `logical_page = safe / PAGE_SIZE`;
+`page_offset = safe % PAGE_SIZE`; `physical_page = block_table[safe_request,
+min(logical_page, PAGE_TABLE_WIDTH-1)]`; valid also requires the request in range,
+`logical_token >= 0`, `logical_page < PAGE_TABLE_WIDTH`, and `physical_page` in
+`[0, num_cache_blocks)`. K is `[HEAD_DIM, BLOCK_N]` and V `[BLOCK_N, HEAD_DIM]`,
+both fetched from the paged cache at `(physical_page, page_offset, kv_head)`;
+`physical_page * block_stride` must be done in **int64** (it overflows int32 for
+large caches). Scores `= q @ k`, scaled by `HEAD_DIM**-0.5 * log2(e)` and masked
+to `-1e20`; online softmax **in base 2** (`exp2`), with the accumulator rescaled
+by `alpha = exp2(max_old - max_new)`. If `NUM_SPLITS == 1` the normalised output
+is stored directly; otherwise store the normalised partial at
+`partial_output[((split_id*num_rows + row)*NUM_QUERY_HEADS + first_head + h)*HEAD_DIM + d]`
+and `partial_lse[(split_id*num_rows + row)*NUM_QUERY_HEADS + first_head + h] =
+max_value + log2(max(normalizer, 1e-20))` (`-inf` when the row has no values).
+
+**merge** — grid `(num_rows, NUM_QUERY_HEADS)`; a 44-line reduction: load
+`lse[BLOCK_SPLITS]`, `m = max(lse)`, `w = exp2(lse - m)` (0 where `lse == -inf`),
+`denom = sum(w)`, `merged = sum(partial_output * w[:, None]) / denom` (0 where
+`denom <= 0`), store to `output[row, head, :]`.
+
+**Do not start from scratch — reuse `csrc/rocm/fa_rdna2.cu`.** It already
+implements paged + GQA + split-k + varlen prefill attention on RDNA2 with this
+fork's idioms (`V_DOT2`, LDS staging, padded strides to dodge the 32-bank
+conflict — see the bank-conflict lesson above). The QSA difference is that K/V are
+gathered by an index list rather than a contiguous causal range, and there is no
+causal mask (the selection already encodes it). Copying its split/merge skeleton
+and swapping the gather is far less work than a fresh flash-attention kernel.
+
 ### To implement
 
 Port the three kernels into `csrc/rocm/qsa_rdna2.cu`, following exactly the
