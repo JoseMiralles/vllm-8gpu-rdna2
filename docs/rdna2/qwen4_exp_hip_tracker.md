@@ -201,6 +201,27 @@ caught it. Returned tensors (`o`, `final_state`) are deliberately not cached.
 So with host cost included the HIP chain is now **-5.6 %** at the production
 chunk size instead of +6.5 %.
 
+#### Round 7 — order-controlled A/B/A on the final build
+
+`off -> on -> off`, same session, fresh server per arm:
+
+| metric | off (1st) | on (2nd) | off (3rd) | on vs off-mean |
+|---|---:|---:|---:|---:|
+| prefill 8k, total tok/s | 1734.8 | 1705.1 | 1722.8 | **-1.4 %** |
+| prefill 16k, total tok/s | 1806.2 | 1793.4 | 1804.5 | **-0.7 %** |
+| decode 128+256, TPOT p50 ms | — | 11.61 | 11.69 | -0.7 % (noise) |
+
+**Net position of the opt-in gates: prefill -0.7 to -1.4 %, decode
+indistinguishable from noise.** The scratch-buffer fix moved 16k from -1.9 %
+to -0.7 %, i.e. roughly two thirds of the gap was host-side per-call cost, but
+the gates are still not a win and **S6 must stay off**.
+
+What is left is smaller than the run-to-run spread of a single arm (±0.4-0.9 %
+on prefill), so the next honest step is not another micro-optimisation: it is
+to decide whether a sub-1 % prefill cost with no decode benefit justifies the
+path at all, or to find the remaining cost with in-server profiling (which
+`rocprofv3 --attach` cannot do here — see the gotcha below).
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
