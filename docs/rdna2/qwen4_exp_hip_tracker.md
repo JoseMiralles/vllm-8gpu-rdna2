@@ -1419,26 +1419,64 @@ time, GPU 0, `torch.profiler`, 30 iters:
 | prefill `rows=512, topk=2048` | 800.9 us | 2072.3 us | +159 % |
 | GQA2 `rows=64, topk=1024` | 216.4 us | 585.3 us | +170 % |
 
-This is a deliberately simple first version, written for correctness. Identified
-fixes in expected-value order:
+This is a deliberately simple first version, written for correctness. A second
+pass (2026-10-14) measured *why* it is slow instead of guessing, and the answer is
+not the one the first write-up assumed.
 
-1. **Every query head's warp gathers the same K/V independently** — `group_size`
-   warps re-read the identical K rows and the identical 128 V dims, so the global
-   read count is `group_size`x what it needs to be. Stage K and V once per tile
-   in LDS (vectorised 8-wide gather, shared by the group).
-2. **The index -> logical page -> physical page lookup runs twice per column**,
-   in the score loop and again in the `P @ V` loop. Compute it once per tile into
-   LDS and share it across the warps.
-3. **The `P @ V` accumulation is scalar fma.** Transposing `v` in LDS enables the
-   pair-over-column `fdot2` form sketched in the design notes.
-4. `q` is re-read from global for every column of the score dot.
+### The gap is not MFMA, and not instruction count
 
-A first attempt at (4) — hoisting `q` into a register array — was **reverted**:
-`head_dim` is a runtime value, so `q_reg[d2]` is dynamically indexed and the
-resource probe shows scratch memory appearing (272 B/lane) instead of registers,
-which would pessimise rather than help. Doing it properly requires templating the
-kernel on `HEAD_DIM` (instantiate 128, the indexer's actual size) or otherwise
-giving the loop a compile-time trip count.
+**gfx1030 has no MFMA**, so Triton's `tl.dot` cannot be a different compute class:
+compiling a `tl.dot` for gfx1030 and reading the ISA shows it lowers to
+`v_dot2c_f32_f16`, the same instruction this kernel already uses. The gap is in the
+memory path. `rocprofv3 --pmc` over one call (GPU 0, 20 iterations,
+`rows=512, topk=2048`, `BLOCK_N=64`, 4 splits):
 
-Until these land, `VLLM_RDNA_QSA_HIP=1` should stay off: previously it made the
-QSA path a wash (HIP indexer + Triton attention), and it is now a net loss.
+| counter, per call | HIP | Triton | ratio |
+|---|---:|---:|---:|
+| `SQ_INSTS_VALU` | 108.6 M | 35.1 M | 3.1x |
+| `SQ_INSTS_SALU` | 421.7 M | 0.63 M | **669x** |
+| `SQ_INSTS_LDS` | 6.2 M | 6.9 M | 0.9x |
+| total | 536.5 M | 42.6 M | 12.6x |
+
+The SALU excess is the two integer divisions by a runtime `page_size` per column,
+per warp, twice per tile (8x what Triton does); Triton instead does one masked 2-D
+tile load per operand, stages it and reads it back 128 bits at a time, while this
+kernel issues 4-byte `half2` loads for `k` and four separate 2-byte
+`global_load_ushort` for `v`, per column, per lane, each with its own 64-bit address
+computation.
+
+### Three cheap fixes were implemented and measured — all washes
+
+| variant | decode `rows=8 topk=512` | prefill `rows=512 topk=2048` | verdict |
+|---|---:|---:|---|
+| baseline | 105.3 us | 2070.5 us | — |
+| (2) index→page lookup hoisted to LDS | 99.9 / 99.3 us | 2116.3 / 2119.3 us | **wash**, reverted |
+| (a) same, counters re-measured | — | — | 536.5 M → 330 M instructions (-38 %) |
+| 4 independent `fdot2` chains for the score dot | 105.1 us | 2082.3 us | **wash**, reverted |
+
+A/B/A in one session (`/tmp/bench_sparse.py`, GPU 0); the box drifts 5-10 % *between*
+sessions, so only in-session pairs mean anything here.
+
+The two results together are the useful finding: **cutting 38 % of the instructions
+changed nothing, and 4x the ILP in the score dot changed nothing**, so this kernel is
+latency-bound on the scattered per-column global loads, and neither instruction count
+nor dot-chain depth is the lever. (2) and the chain split were therefore reverted
+rather than landed as unmeasurable churn.
+
+### What is left, and what it has to beat
+
+Fixes (1) and (3) — the shared staged K/V — remain, and the measurements above say
+they must land **as one rewrite**: K and V gathered once per tile into LDS with a
+vectorised 8-wide gather shared across the group's warps, then read back as `b128`
+for the score dot and in transposed form for `P @ V`. That is the only remaining
+change that touches the measured bottleneck (redundant, scalar, scattered global
+loads). (4) — hoisting `q` — still needs the kernel templated on `HEAD_DIM` first:
+`head_dim` is runtime, so `q_reg[d2]` is dynamically indexed and the resource probe
+shows 272 B/lane of scratch instead of registers. Do not retry (4) before the
+template lands.
+
+**Validate any rewrite with `rocprofv3` time, not with counters**: this pass is the
+proof that counter reductions here do not imply speed.
+
+Until the rewrite lands, `VLLM_RDNA_QSA_HIP=1` should stay off: previously it made
+the QSA path a wash (HIP indexer + Triton attention), and it is now a net loss.
