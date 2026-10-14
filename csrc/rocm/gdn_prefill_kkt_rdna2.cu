@@ -14,11 +14,17 @@
 // matrix (beta * K * K^T) that solve_tril later inverts.
 //
 // CRITICAL PARITY RULE (gfx1030): the call site sets
-// _CAST_DOT_TO_K_DTYPE = on_gfx1x() = False on gfx1030, so beta-scaled k
-// stays in fp32 and the [64,128] @ [128,64] dot is a pure fp32 x fp32 FMA
-// accumulation. Do NOT use V_DOT2 here -- it would change the result.
-// k is loaded from memory as fp16, cast to fp32, scaled by the fp32 beta,
-// then accumulated with plain fp32 FMA.
+// _CAST_DOT_TO_K_DTYPE = on_gfx1x() or on_gfx10x() -- True on gfx1030 -- so
+// the reference computes b_kb = b_k * beta in fp32, rounds it back to k's
+// fp16 storage dtype, and only then does the dot:
+//
+//   b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
+//
+// The beta-scaled operand therefore carries an fp16 rounding and the dot is
+// fp16 x fp16 with an fp32 accumulator. An earlier version of this kernel
+// kept b_kb in fp32 (the comment above used to claim CAST_DOT_TO_K_DTYPE was
+// False on gfx1030, which stopped being true when the `or on_gfx10x()` was
+// added upstream), and every parity case failed by up to 0.07 absolute.
 //
 // Workgroup = one (chunk, head). 256 threads. The k tile [64,128] (fp16,
 // 16 KB) is staged in LDS; each thread owns a 4x4 sub-tile of the [64,64]
@@ -36,6 +42,13 @@ namespace {
 constexpr int KKT_BT = 64;        // chunk size (FLA_CHUNK_SIZE)
 constexpr int KKT_K = 128;        // head_k_dim
 constexpr int KKT_THREADS = 256;  // 16 row-tiles x 16 col-tiles of 4x4
+// LDS row stride, padded. The column reads of the inner loop walk rows at a
+// stride of KKT_K halves = 256 B = 64 dwords, a multiple of the 32 LDS banks,
+// so all 16 column lanes hit one bank (16-way conflict). The lanes are 4 rows
+// apart, so their dword stride is 2*KKT_KP; KKT_KP = K + 2 makes that 260,
+// i.e. 4 (mod 32) -- the widest spread a 4-row lane stride can reach, giving
+// 8 distinct banks (2-way conflict) instead of 1.
+constexpr int KKT_KP = KKT_K + 2;
 
 template <bool IS_VARLEN>
 __global__ void __launch_bounds__(KKT_THREADS)
@@ -74,7 +87,7 @@ __global__ void __launch_bounds__(KKT_THREADS)
   const int hg = i_h / (int)(H / Hg);  // key head index (H >= Hg, H % Hg == 0)
 
   // Stage the k tile [BT, K] (fp16) in LDS: 16 KB.
-  __shared__ __half s_k[KKT_BT * KKT_K];
+  __shared__ __half s_k[KKT_BT * KKT_KP];
   const int tid = threadIdx.x;
 #pragma unroll
   for (int it = 0; it < KKT_BT * KKT_K / KKT_THREADS; ++it) {
@@ -85,7 +98,7 @@ __global__ void __launch_bounds__(KKT_THREADS)
     if (row < t_chunk) {
       val = k[(t_row_base + row) * Hg * K_dim + (long)hg * K_dim + col];
     }
-    s_k[row * KKT_K + col] = val;
+    s_k[row * KKT_KP + col] = val;
   }
   __syncthreads();
 
@@ -116,11 +129,12 @@ __global__ void __launch_bounds__(KKT_THREADS)
     for (int kk = 0; kk < KKT_K; ++kk) {
       // beta applied inside the dot exactly as the reference (b_kb = b_k *
       // beta[:, None]); the dot is fp32 x fp32 FMA.
-      const float kb = beta_i * __half2float(s_k[i * KKT_K + kk]);
-      acc[0] += kb * __half2float(s_k[(j0 + 0) * KKT_K + kk]);
-      acc[1] += kb * __half2float(s_k[(j0 + 1) * KKT_K + kk]);
-      acc[2] += kb * __half2float(s_k[(j0 + 2) * KKT_K + kk]);
-      acc[3] += kb * __half2float(s_k[(j0 + 3) * KKT_K + kk]);
+      const float kb = __half2float(
+          __float2half_rn(beta_i * __half2float(s_k[i * KKT_KP + kk])));
+      acc[0] += kb * __half2float(s_k[(j0 + 0) * KKT_KP + kk]);
+      acc[1] += kb * __half2float(s_k[(j0 + 1) * KKT_KP + kk]);
+      acc[2] += kb * __half2float(s_k[(j0 + 2) * KKT_KP + kk]);
+      acc[3] += kb * __half2float(s_k[(j0 + 3) * KKT_KP + kk]);
     }
 #pragma unroll
     for (int m = 0; m < 4; ++m) {

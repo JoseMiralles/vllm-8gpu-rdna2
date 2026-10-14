@@ -65,12 +65,23 @@ static_assert(GDN_BT / GDN_AROW * GDN_BT / GDN_ACOL == GDN_THREADS,
 static_assert(GDN_BT / GDN_AROW * GDN_BV / GDN_OCOL == GDN_THREADS,
               "thread count must also equal (BT/AROW)*(BV/OCOL)");
 
+// LDS row strides, padded. Every dot below reads a staged tile column-wise
+// with one lane per column group, so the lane-to-lane address stride is a
+// multiple of the row stride. The natural strides (K = 128 halves = 64
+// dwords, BT = 64 halves = 32 dwords) are multiples of the 32 LDS banks, so
+// all 16 column lanes of a row-tile land in ONE bank: a 16-way conflict on
+// every read of s_k, s_h and s_v. +2 halves makes the row stride an odd
+// number of dwords, which spreads the lanes over 8 (s_k, 2 rows apart x 4)
+// or 16 (s_h, s_v, 2 rows apart) banks.
+constexpr int GDN_QS = GDN_K + 2;   // 130: s_q / s_k / s_h row stride (halves)
+constexpr int GDN_VS = GDN_BT + 2;  //  66: s_v row stride (halves)
+
 // LDS byte sizes (fp16 = 2 bytes, fp32 = 4 bytes).
-constexpr int GDN_LDS_Q_BYTES = GDN_BT * GDN_K * 2;  // 16384 (s_q [BT,K] fp16)
-constexpr int GDN_LDS_K_BYTES = GDN_BT * GDN_K * 2;  // 16384 (s_k [BT,K] fp16)
-constexpr int GDN_LDS_H_BYTES = GDN_BV * GDN_K * 2;  //  8192 (s_h [BV,K] fp16)
+constexpr int GDN_LDS_Q_BYTES = GDN_BT * GDN_QS * 2;  // 16640 (s_q [BT,K] fp16)
+constexpr int GDN_LDS_K_BYTES = GDN_BT * GDN_QS * 2;  // 16640 (s_k [BT,K] fp16)
+constexpr int GDN_LDS_H_BYTES = GDN_BV * GDN_QS * 2;  //  8320 (s_h [BV,K] fp16)
 constexpr int GDN_LDS_V_BYTES =
-    GDN_BT * GDN_BV * 2;                  //  4096 (s_v_T [BV,BT] fp16)
+    GDN_BV * GDN_VS * 2;                  //  4224 (s_v_T [BV,BT] fp16)
 constexpr int GDN_LDS_G_FLOATS = GDN_BT;  // 64 * 4 = 256 bytes
 constexpr int GDN_LDS_BA_BYTES = GDN_BT * GDN_BT * 4;  // 16384 (s_bA fp32)
 // s_bA gets its own slot. It MUST NOT alias s_q: the compiler cannot see that
@@ -97,7 +108,7 @@ __device__ __forceinline__ float gdn_fdot2(half2 a, half2 b, float acc) {
 // NOT read OOB from global). For q/k (T dimension), valid_rows =
 // max(0, T_local - i_t*BT). For h (V dimension), V==128==ROWS and
 // is always in-bounds.
-template <typename HT, int ROWS, int COLS>
+template <typename HT, int ROWS, int COLS, int LDS_COLS = COLS>
 __device__ __forceinline__ void gdn_lds_load(__half* dst, const HT* src,
                                              long src_stride, int valid_rows) {
   constexpr int TOTAL = ROWS * COLS;
@@ -114,9 +125,12 @@ __device__ __forceinline__ void gdn_lds_load(__half* dst, const HT* src,
 #pragma unroll
     for (int s = 0; s < HALF2_PER_THREAD; ++s) {
       const int idx = s * GDN_THREADS + threadIdx.x;
-      // idx enumerates every half2 slot of the tile exactly once, so this
-      // zeroes the whole tile (the previous form only cleared columns 0,1).
-      const long loff = (long)idx * 2;
+      // idx enumerates every half2 slot of the (unpadded) tile exactly once,
+      // so this zeroes the whole tile (the previous form only cleared
+      // columns 0,1). Row/col decomposition keeps the padded stride.
+      const int row = idx / (COLS / 2);
+      const int col_v = (idx % (COLS / 2)) * 2;
+      const long loff = (long)row * LDS_COLS + col_v;
       dst[loff] = __float2half(0.0f);
       dst[loff + 1] = __float2half(0.0f);
     }
@@ -128,7 +142,7 @@ __device__ __forceinline__ void gdn_lds_load(__half* dst, const HT* src,
     const int col_v = (idx % (COLS / 2)) * 2;
     if (row >= valid_rows) continue;  // OOB rows: leave as zero (or skip store)
     const long goff = (long)row * src_stride + col_v;
-    const long loff = (long)row * COLS + col_v;
+    const long loff = (long)row * LDS_COLS + col_v;
     if constexpr (std::is_same<HT, float>::value) {
       dst[loff] = __float2half_rn(src[goff]);
       dst[loff + 1] = __float2half_rn(src[goff + 1]);
@@ -167,7 +181,7 @@ __device__ __forceinline__ void gdn_lds_load_v_transposed(
     const int c = idx / BV;
     const int oc = idx % BV;
     const long goff = (long)c * src_stride + oc;
-    const long loff = (long)oc * BT + c;
+    const long loff = (long)oc * GDN_VS + c;
     if (c < valid_rows) {
       dst[loff] = src[goff];
     } else {
@@ -311,10 +325,10 @@ gdn_prefill_o_rdna2_kernel(
     const long chunk_off_qk = (long)i_t_local * GDN_BT * stride_q_tok;
     const long chunk_off_v = (long)i_t_local * GDN_BT * stride_v_tok;
     const int valid_rows = T_local - i_t_local * GDN_BT;
-    gdn_lds_load<__half, GDN_BT, GDN_K>(s_q, p_q + chunk_off_qk, stride_q_tok,
-                                        valid_rows);
-    gdn_lds_load<__half, GDN_BT, GDN_K>(s_k, p_k + chunk_off_qk, stride_k_tok,
-                                        valid_rows);
+    gdn_lds_load<__half, GDN_BT, GDN_K, GDN_QS>(
+        s_q, p_q + chunk_off_qk, stride_q_tok, valid_rows);
+    gdn_lds_load<__half, GDN_BT, GDN_K, GDN_QS>(
+        s_k, p_k + chunk_off_qk, stride_k_tok, valid_rows);
     __syncthreads();
 
     // ---- Dot 1: b_A += q @ k^T (V_DOT2_F32_F16, fp32 accum) ---------
@@ -325,13 +339,13 @@ gdn_prefill_o_rdna2_kernel(
 #pragma unroll
       for (int dr = 0; dr < GDN_AROW; ++dr) {
         const int row = rb * GDN_AROW + dr;
-        q_pair[dr] = *reinterpret_cast<half2*>(&s_q[row * GDN_K + kp * 2]);
+        q_pair[dr] = *reinterpret_cast<half2*>(&s_q[row * GDN_QS + kp * 2]);
       }
       half2 k_pair[GDN_ACOL];
 #pragma unroll
       for (int dc = 0; dc < GDN_ACOL; ++dc) {
         const int col = cb * GDN_ACOL + dc;
-        k_pair[dc] = *reinterpret_cast<half2*>(&s_k[col * GDN_K + kp * 2]);
+        k_pair[dc] = *reinterpret_cast<half2*>(&s_k[col * GDN_QS + kp * 2]);
       }
 #pragma unroll
       for (int dr = 0; dr < GDN_AROW; ++dr)
@@ -343,8 +357,8 @@ gdn_prefill_o_rdna2_kernel(
     __syncthreads();
 
     // ---- Stage 2: load h[BV, K] into LDS (templated on h dtype) -----
-    gdn_lds_load<HT, GDN_BV, GDN_K>(s_h, p_h + (long)i_v * GDN_BV * GDN_K,
-                                    GDN_K, GDN_BV);
+    gdn_lds_load<HT, GDN_BV, GDN_K, GDN_QS>(
+        s_h, p_h + (long)i_v * GDN_BV * GDN_K, GDN_K, GDN_BV);
     __syncthreads();
 
     // ---- Dot 2: b_o += q @ h^T (V_DOT2_F32_F16) ----------------------
@@ -355,13 +369,13 @@ gdn_prefill_o_rdna2_kernel(
 #pragma unroll
       for (int dr = 0; dr < GDN_AROW; ++dr) {
         const int row = rb * GDN_AROW + dr;
-        q_pair[dr] = *reinterpret_cast<half2*>(&s_q[row * GDN_K + kp * 2]);
+        q_pair[dr] = *reinterpret_cast<half2*>(&s_q[row * GDN_QS + kp * 2]);
       }
       half2 h_pair[GDN_OCOL];
 #pragma unroll
       for (int do_ = 0; do_ < GDN_OCOL; ++do_) {
         const int oc = cb * GDN_OCOL + do_;
-        h_pair[do_] = *reinterpret_cast<half2*>(&s_h[oc * GDN_K + kp * 2]);
+        h_pair[do_] = *reinterpret_cast<half2*>(&s_h[oc * GDN_QS + kp * 2]);
       }
 #pragma unroll
       for (int dr = 0; dr < GDN_AROW; ++dr)
@@ -470,7 +484,7 @@ gdn_prefill_o_rdna2_kernel(
 #pragma unroll
           for (int do_ = 0; do_ < GDN_OCOL; ++do_) {
             const int oc = cb * GDN_OCOL + do_;
-            const long v_off = (long)oc * GDN_BT + cp * 2;
+            const long v_off = (long)oc * GDN_VS + cp * 2;
             // s_v_T[oc, cp*2..cp*2+1] = (v[cp*2, oc], v[cp*2+1, oc])
             half2 v_pair = *reinterpret_cast<half2*>(&s_v[v_off]);
             // dot = bA[r, cp*2]*v[cp*2, oc] + bA[r, cp*2+1]*v[cp*2+1, oc]

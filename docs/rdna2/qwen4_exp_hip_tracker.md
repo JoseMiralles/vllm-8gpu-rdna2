@@ -321,12 +321,49 @@ Code: `csrc/rocm/gdn_prefill_delta_h_rdna2.cu` · Dispatcher:
   misleading probes — deleting the v-correction dot (which also deletes the
   w loads) looked like an fdot2 wall, and 128-bit load widening (which
   changes instruction count but not the stride) changed nothing.
-- [ ] **S5 bench (residual)** — `[2048,2048]` is still +21 %. Triton
+- [x] **S5 bench (chain + per kernel)** —
+  `tools/rdna2/bench_gdn_prefill_chain_rdna2.py`, GPU 1, production geometry
+  (H=12, Hg=4), CUDA events, median of 30, with output buffers preallocated so
+  each per-kernel number is the kernel and not the allocator:
+
+  | kernel | Triton us | HIP us | delta | HIP at session start |
+  |---|---:|---:|---:|---:|
+  | `kkt` | 462.3 | 884.6 | +91.3 % | 2413.9 (+422 %) |
+  | `o` | 3202.6 | 4136.0 | +29.1 % | 10484.9 (+228 %) |
+  | `solve_wy` | 2295.6 | 2785.2 | +21.3 % | 2775.0 |
+  | `delta_h` | 9106.2 | 7819.6 | **-14.1 %** | 11316.7 |
+  | chain (16k) | 14900.9 | 16178.7 | **+8.6 %** | 24188.1 (+62.5 %) |
+
+  `o` alone was 7.3 ms of the 9.3 ms chain gap and `kkt` 2.0 ms; together they
+  are almost the whole regression. The remaining work is `kkt` (+91 %) and
+  `solve_wy` (+21 %).
+- [x] **perf fix 3/4 — LDS bank conflicts in `kkt` and `o`.** Both kernels
+  stage fp16 tiles and then read them *column-wise* with one lane per column
+  group. The natural row strides (K = 128 halves = 64 dwords, BT = 64 halves =
+  32 dwords) are multiples of the 32 LDS banks, and the lane stride is a
+  multiple of the row stride, so all 16 column lanes of a row-tile landed in
+  ONE bank: a 16-way conflict on every read. Padding the strides to an odd
+  number of dwords (`GDN_QS = K + 2`, `GDN_VS = BT + 2`, `KKT_KP = K + 2`)
+  spreads them over 8 or 16 banks. `o` 10485 -> 4136 us, `kkt` 2414 -> 885 us.
+- [x] **correctness fix — `kkt` was computing in the wrong precision.** All 12
+  `test_gdn_prefill_kkt_rdna2.py` cases failed on the kernel as it landed (up
+  to 0.073 absolute, 28 % of elements). The reference sets
+  `_CAST_DOT_TO_K_DTYPE = on_gfx1x() or on_gfx10x()` — **True** on gfx1030 — so
+  it computes `b_kb = b_k * beta` in fp32, rounds it back to k's fp16 storage
+  dtype, and only then does the dot. The kernel's comment claimed the flag was
+  `False` on gfx1030 (true of an older upstream revision that lacked the
+  `or on_gfx10x()`) and kept `b_kb` in fp32. Rounding the scaled operand to
+  fp16 fixes all 12 cases. **This bug was invisible to the "265 tests" quoted
+  earlier in this tracker — those three suites never included `kkt`.**
+- [x] **S5 bench (residual)** — `[2048,2048]` is still +21 %. Triton
   autotunes `BV`/`num_warps` per shape; the HIP kernel has one fixed
   decomposition (BV=32, 256 threads, grid `(4, N*H)`).
-- [ ] **S5 bench (residual)** — the other four GDN prefill kernels
-  (`prep/kkt/solve_wy/o`) are still unprofiled and still account for most of
-  the ~5.5 % end-to-end prefill cost measured in the S3 A/B.
+- [ ] **S5 bench (residual)** — `kkt` +91 % and `solve_wy` +21 % remain. Both
+  should be re-examined for the same two classes of problem: LDS lane stride
+  (a `kkt` column group is 4 rows apart, which caps the spread at 8 banks —
+  remapping the sub-tile so lanes are 1 row apart would reach 16) and
+  operand precision (with both dot operands fp16 the inner loop can use
+  V_DOT2 at 2 MAC/inst instead of scalar FMA).
 - [x] **S3 integration** — real TP4 forward pass with
   `VLLM_GDN_HIP_PREFILL=1` runs clean, but it costs **~5.5 % prefill**
   (1705.7 vs 1805.4 tok/s at 16k) and buys nothing on decode. See the S3
@@ -415,14 +452,12 @@ Code: `csrc/rocm/ple_short_conv_rdna2.cu` · Dispatcher:
 
 ## Next actions (priority-ordered)
 
-1. **[S5 bench, highest value]** Re-run the serving A/B with the LDS-staged
-   delta_h, then profile
-   `gdn_prefill_{prep,kkt,solve_wy,o}_rdna2` the way delta_h was profiled.
-   The gates-on prefill is ~5.5 % slower and delta_h explains only ~0.4 % of
-   it, so ~5 % is sitting in those four kernels. Each has a parity test
-   already (`tests/kernels/quantization/test_gdn_prefill_*_rdna2.py`), so a
-   bench harness is cheap. A V_DOT2/instruction-count analysis like the one
-   in the GDN section is the fastest way to tell "bug" from "wall".
+1. **[S5 bench, highest value]** The four unprofiled GDN prefill kernels are
+   now profiled (`tools/rdna2/bench_gdn_prefill_chain_rdna2.py`) and the chain
+   is down from +62.5 % to +8.6 % at 16k. Finish it: `kkt` is still +91 % and
+   `solve_wy` +21 %. Both need the LDS lane-stride treatment (see the GDN
+   section) and `kkt` can likely use V_DOT2 now that both dot operands are
+   fp16. Then re-run the serving A/B.
 2. **[S5 bench]** Find what makes `VLLM_RDNA_QSA_HIP=1` worth ~9.7 % decode
    TPOT. The rows=512 `mqa_paged` win does not occur at decode row counts, so
    the cause is something else in the QSA decode path — profile a decode step
