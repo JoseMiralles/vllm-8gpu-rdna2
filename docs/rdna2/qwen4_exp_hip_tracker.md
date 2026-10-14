@@ -277,35 +277,48 @@ Code: `csrc/rocm/gdn_prefill_delta_h_rdna2.cu` · Dispatcher:
 
   | seq_lens | Triton us | HIP us | delta |
   |---|---:|---:|---:|
-  | `[64,192,128]` | 229.0 | 268.4 | +17.2 % |
-  | `[4096]` | 1989.6 | 2429.9 | +22.1 % |
-  | `[2048,2048]` | 1278.8 | 2495.2 | +95.1 % |
-  | `[8192]` | 4262.0 | 5268.6 | +23.6 % |
-  | `[8192]x4` | 12727.7 | 19550.9 | +53.6 % |
+  | `[64,192,128]` | 229.0 | 216.1 | **-5.7 %** |
+  | `[4096]` | 1995.7 | 1832.6 | **-8.2 %** |
+  | `[2048,2048]` | 1392.6 | 1686.3 | +21.1 % |
+  | `[8192]` | 4389.7 | 3762.5 | **-14.3 %** |
+  | `[8192]x4` | 12882.6 | 12078.5 | **-6.2 %** |
 
-  So HIP is ~20 % behind at single-sequence prefill, not the 5.5 % the draft
-  PR claims, and ~2x behind when several long sequences share the batch.
-  **This is now close to the hardware wall, not a fixable bug.** Both kernels
-  are V_DOT2-issue-bound: the algorithm needs 1.6e9 `v_dot2_f32_f16`
-  (2 MAC/inst) and gfx1030 issues 1/cycle/SIMD, so ~3.9 ms at [8192] is the
-  floor. Triton sits at ~4.26 ms (92 % of that), HIP at ~5.27 ms (74 %).
-  Evidence: deleting the v-correction dot alone (halving fdot2) drops HIP to
-  3001 us; and cutting ~17 % of the loop's instructions by widening the k/w
-  loads to 128-bit changed nothing, so the kernel is not instruction-count
-  bound.
-- [x] **perf fix landed** — the loop used a live `float v_corr[GDN_BT]` (64
-  registers) across a fully unrolled 32-iteration h-update loop. That needed
-  256 VGPRs + 427 spilled + 1632 B/lane of scratch, and cost 2.3-3.3x vs
-  Triton at prefill scale. Fusing v-correction, gating and h-update into one
-  t-pair loop (v-corr only needs the pre-decay `h_fp16`, already in
-  registers) plus `#pragma unroll 8` on that loop needs 185 VGPRs and 0
-  spill.
+  **HIP now beats Triton on prefill**, which is the opposite of what the draft
+  PR documents (-5.5 %). The only remaining loss is `[2048,2048]` (two
+  sequences in one batch), where Triton's per-shape autotune picks a better
+  config than a fixed grid can.
+- [x] **perf fix 1/2 — fusion.** The loop used a live `float v_corr[GDN_BT]`
+  (64 registers) across a fully unrolled 32-iteration h-update loop. That
+  needed 256 VGPRs + 427 spilled + 1632 B/lane of scratch and cost 2.3-3.3x
+  vs Triton at prefill scale. Fusing v-correction, gating and h-update into
+  one t-pair loop (v-corr only needs the pre-decay `h_fp16`, already in
+  registers) plus `#pragma unroll 8` needs 185 VGPRs and 0 spill.
+- [x] **perf fix 2/2 — LDS staging** (port of upstream `92e8924078`, the
+  work PR #69 tracks). Each chunk's k/w/u/g was reread from global memory by
+  the inner dots, one strided 32-byte row per token. One coalesced pass per
+  chunk into 37120 B of LDS removes that: `[8192]` 5269 -> 3762 us, and the
+  kernel goes from +23.6 % to -14.3 % vs Triton. VGPRs 193, 0 spill.
+  **This is what settled the bottleneck question**: the kernel was
+  *memory-latency bound on strided global reads*, not V_DOT2-issue bound.
+  An earlier version of this section claimed the opposite from two
+  misleading probes — deleting the v-correction dot (which also deletes the
+  w loads) looked like an fdot2 wall, and 128-bit load widening (which
+  changes instruction count but not the stride) changed nothing.
+- [ ] **S5 bench (residual)** — `[2048,2048]` is still +21 %. Triton
+  autotunes `BV`/`num_warps` per shape; the HIP kernel has one fixed
+  decomposition (BV=32, 256 threads, grid `(4, N*H)`).
+- [ ] **S5 bench (residual)** — the other four GDN prefill kernels
+  (`prep/kkt/solve_wy/o`) are still unprofiled and still account for most of
+  the ~5.5 % end-to-end prefill cost measured in the S3 A/B.
 - [x] **S3 integration** — real TP4 forward pass with
   `VLLM_GDN_HIP_PREFILL=1` runs clean, but it costs **~5.5 % prefill**
   (1705.7 vs 1805.4 tok/s at 16k) and buys nothing on decode. See the S3
-  serving A/B section. delta_h itself accounts for only ~0.4 % of that, so
-  the rest is in the other four GDN prefill kernels.
-- [ ] **S6 default-on** — do not flip: the gate is a measured 5.5 % prefill
+  serving A/B section. That A/B was taken before the LDS staging landed;
+  delta_h then cost ~0.8 % of the prefill and now saves ~0.5 %, so the gate
+  should be at roughly -4 % now — still a regression, because the other four
+  GDN prefill kernels are unprofiled. Re-measuring it is the first item in
+  "Next actions".
+- [ ] **S6 default-on** — do not flip: the gate is a measured prefill
   regression and the remaining kernels have not been profiled.
 
 ---
@@ -385,7 +398,8 @@ Code: `csrc/rocm/ple_short_conv_rdna2.cu` · Dispatcher:
 
 ## Next actions (priority-ordered)
 
-1. **[S5 bench, highest value]** Profile
+1. **[S5 bench, highest value]** Re-run the serving A/B with the LDS-staged
+   delta_h, then profile
    `gdn_prefill_{prep,kkt,solve_wy,o}_rdna2` the way delta_h was profiled.
    The gates-on prefill is ~5.5 % slower and delta_h explains only ~0.4 % of
    it, so ~5 % is sitting in those four kernels. Each has a parity test
