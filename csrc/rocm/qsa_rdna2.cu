@@ -668,3 +668,155 @@ std::tuple<at::Tensor, at::Tensor> qsa_mqa_paged_rdna2(
   }
   return {logits, visible_blocks};
 }
+
+// ---------------------------------------------------------------------------
+// qsa_expand_indices_rdna2: expand compressed block indices into token indices
+// and compact the causal tail of the open group. Port of the Triton
+// `_expand_qsa_indices_kernel` in vllm/models/qwen4_exp/amd/ops/qsa.py.
+//
+// output_width = token_topk + compress_ratio - 1, block_topk =
+// token_topk / compress_ratio. One thread per output element; slots that are
+// neither an expanded block entry nor a valid tail entry are written as -1.
+// ---------------------------------------------------------------------------
+namespace {
+
+template <typename TPos, typename TSeq>
+__global__ void qsa_expand_indices_kernel(
+    const int32_t* __restrict__ block_indices,
+    const TPos* __restrict__ query_positions,
+    const TSeq* __restrict__ sequence_lengths,
+    const int32_t* __restrict__ token_to_req, int32_t* __restrict__ out,
+    int64_t stride_blocks_row, int64_t stride_blocks_column,
+    int64_t stride_out_row, int64_t stride_out_column, int rows,
+    int num_requests, int block_topk, int compress_ratio, int output_width) {
+  const int row = blockIdx.x;
+  const int col = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+  if ((row >= rows) || (col >= output_width)) return;
+
+  const int64_t query_position = (int64_t)query_positions[row];
+  const int32_t request = token_to_req[row];
+  const bool valid_request = (request >= 0) && (request < num_requests);
+  const int safe_request = min(max((int)request, 0), num_requests - 1);
+  const int64_t sequence_length =
+      valid_request ? (int64_t)sequence_lengths[safe_request] : 0;
+  const int64_t complete_blocks =
+      min(min((query_position + 1) / compress_ratio,
+              sequence_length / compress_ratio),
+          (int64_t)block_topk);
+  const int expanded_count = (int)complete_blocks * compress_ratio;
+  const int tail_start = (int)((query_position + 1) / compress_ratio) * compress_ratio;
+  const int tail_count = (int)((query_position + 1) - tail_start);
+
+  int token = -1;
+  if (col < expanded_count) {
+    // Expanded block entry. Guarded exactly like Triton's masked load, so a
+    // zero block_topk never reads (its expanded_count is 0 and nothing takes
+    // this branch).
+    const int block_rank = col / compress_ratio;
+    const int offset = col - block_rank * compress_ratio;
+    const int safe_rank = min(block_rank, block_topk - 1);
+    const int64_t block =
+        block_indices[(int64_t)row * stride_blocks_row
+                      + (int64_t)safe_rank * stride_blocks_column];
+    token = (int)(block * compress_ratio + offset);
+  } else {
+    // Compaction of the causal tail of the open group.
+    const int tail_offset = col - expanded_count;
+    if ((tail_offset < tail_count) && (tail_offset < compress_ratio - 1)) {
+      token = tail_start + tail_offset;
+    }
+  }
+  const bool valid = (token >= 0) && ((int64_t)token < sequence_length);
+  out[(int64_t)row * stride_out_row + (int64_t)col * stride_out_column] =
+      valid ? token : -1;
+}
+
+}  // namespace
+
+torch::Tensor qsa_expand_indices_rdna2(
+    const at::Tensor& block_indices, const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths, const at::Tensor& token_to_req,
+    int64_t compress_ratio, int64_t token_topk,
+    c10::optional<at::Tensor> out) {
+  TORCH_CHECK(block_indices.scalar_type() == at::kInt,
+              "qsa_expand_indices_rdna2: block_indices int32 only");
+  TORCH_CHECK(block_indices.dim() == 2,
+              "qsa_expand_indices_rdna2: block_indices must be 2D");
+  TORCH_CHECK(token_to_req.scalar_type() == at::kInt,
+              "qsa_expand_indices_rdna2: token_to_req int32 only");
+  TORCH_CHECK(compress_ratio > 0,
+              "qsa_expand_indices_rdna2: compress_ratio > 0");
+  TORCH_CHECK(token_topk >= 0,
+              "qsa_expand_indices_rdna2: token_topk >= 0");
+  TORCH_CHECK(compress_ratio == 0 || token_topk % compress_ratio == 0,
+              "qsa_expand_indices_rdna2: token_topk must be divisible by "
+              "compress_ratio");
+
+  const int64_t rows = block_indices.size(0);
+  const int64_t block_topk = token_topk / compress_ratio;
+  const int64_t output_width = token_topk + compress_ratio - 1;
+  TORCH_CHECK(block_indices.size(1) == block_topk,
+              "qsa_expand_indices_rdna2: block_indices must be [rows, "
+              "token_topk / compress_ratio]");
+  TORCH_CHECK(query_positions.numel() == rows,
+              "qsa_expand_indices_rdna2: query_positions must have one entry "
+              "per row");
+  TORCH_CHECK(token_to_req.numel() == rows,
+              "qsa_expand_indices_rdna2: token_to_req must have one entry per "
+              "row");
+  TORCH_CHECK(sequence_lengths.dim() == 1 && sequence_lengths.numel() > 0,
+              "qsa_expand_indices_rdna2: sequence_lengths must be nonempty 1D");
+  const auto pos_dtype = query_positions.scalar_type();
+  const auto seq_dtype = sequence_lengths.scalar_type();
+  TORCH_CHECK((pos_dtype == at::kLong || pos_dtype == at::kInt) &&
+                  (seq_dtype == at::kLong || seq_dtype == at::kInt),
+              "qsa_expand_indices_rdna2: query_positions/sequence_lengths must "
+              "be int32 or int64");
+
+  at::Tensor result;
+  if (out.has_value() && out->defined()) {
+    result = *out;
+    TORCH_CHECK(result.scalar_type() == at::kInt,
+                "qsa_expand_indices_rdna2: out int32 only");
+    TORCH_CHECK(result.dim() == 2 && result.size(0) == rows &&
+                    result.size(1) == output_width,
+                "qsa_expand_indices_rdna2: out must be [rows, token_topk + "
+                "compress_ratio - 1]");
+  } else {
+    result = at::empty({rows, output_width},
+                       at::dtype(at::kInt).device(block_indices.device()));
+  }
+  if (rows == 0 || output_width == 0) return result;
+
+  constexpr int kColumnBlock = 256;
+  const at::cuda::OptionalCUDAGuard guard(block_indices.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t num_requests = sequence_lengths.numel();
+  dim3 grid((unsigned)rows,
+            (unsigned)((output_width + kColumnBlock - 1) / kColumnBlock));
+
+  auto launch = [&](auto pos_tag, auto seq_tag) {
+    using TPos = decltype(pos_tag);
+    using TSeq = decltype(seq_tag);
+    qsa_expand_indices_kernel<TPos, TSeq><<<grid, kColumnBlock, 0, stream>>>(
+        block_indices.const_data_ptr<int32_t>(),
+        reinterpret_cast<const TPos*>(query_positions.const_data_ptr()),
+        reinterpret_cast<const TSeq*>(sequence_lengths.const_data_ptr()),
+        token_to_req.const_data_ptr<int32_t>(),
+        result.mutable_data_ptr<int32_t>(), block_indices.stride(0),
+        block_indices.stride(1), result.stride(0), result.stride(1), (int)rows,
+        (int)num_requests, (int)block_topk, (int)compress_ratio,
+        (int)output_width);
+  };
+  if (pos_dtype == at::kLong && seq_dtype == at::kInt) {
+    launch((int64_t)0, (int32_t)0);
+  } else if (pos_dtype == at::kLong) {
+    launch((int64_t)0, (int64_t)0);
+  } else if (seq_dtype == at::kInt) {
+    launch((int32_t)0, (int32_t)0);
+  } else {
+    launch((int32_t)0, (int64_t)0);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return result;
+}

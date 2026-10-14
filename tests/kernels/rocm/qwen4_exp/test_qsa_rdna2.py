@@ -9,6 +9,7 @@ reference kernels in ``vllm/models/qwen4_exp/amd/ops/qsa.py``:
 - ``qsa_store_cache_rows_rdna2``   vs ``_store_qsa_rows_kernel``
 - ``qsa_compress_groups_rdna2``    vs ``_compress_qsa_groups_kernel``
 - ``qsa_mqa_paged_rdna2``          vs ``_qsa_mqa_paged_kernel``
+- ``qsa_expand_indices_rdna2``      vs ``_expand_qsa_indices_kernel``
 
 The HIP path is opt-in (``VLLM_RDNA_QSA_HIP=1``); these tests call the HIP
 wrappers directly and pin the Triton side off with a monkeypatched gate, so
@@ -51,6 +52,7 @@ HIP_QSA_OPS = [
     "_rocm_C::qsa_store_cache_rows_rdna2",
     "_rocm_C::qsa_compress_groups_rdna2",
     "_rocm_C::qsa_mqa_paged_rdna2",
+    "_rocm_C::qsa_expand_indices_rdna2",
 ]
 
 
@@ -695,3 +697,131 @@ def test_qsa_hip_ops_are_cudagraph_safe(triton_gate):
     torch.cuda.synchronize()
 
     assert bool((store_cache != 0).any()), "store_cache_rows did not replay"
+
+
+# --- expand_qsa_block_indices_cuda vs qsa_expand_indices_rdna2 ---------------
+
+
+def _expand_inputs(rows, block_topk, ratio, num_requests, seed=0, strided=False):
+    """Build inputs for the index-expansion op.
+
+    Block ids are drawn from a plausible page range; query positions and
+    sequence lengths are chosen so that rows cover the three regimes the kernel
+    distinguishes: fully expanded, open group with a partial tail, and
+    out-of-range (invalid request / token past the sequence end).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    blocks = torch.randint(
+        0, 4096, (rows, block_topk), device=device, dtype=torch.int32, generator=gen
+    )
+    if strided:
+        # Force a non-unit row stride: the kernel takes both strides, so this
+        # exercises the stride path rather than assuming contiguity.
+        wide = torch.full(
+            (rows, block_topk * 2), -7, device=device, dtype=torch.int32
+        )
+        wide[:, ::2] = blocks
+        blocks = wide[:, ::2]
+    token_to_req = torch.randint(
+        0, num_requests, (rows,), device=device, dtype=torch.int32, generator=gen
+    )
+    if rows:
+        token_to_req[0] = -1  # invalid request -> not valid_request
+    # Positions spread across the compressed range so some rows are fully
+    # expanded, some have an open tail, and some exceed the sequence length.
+    query_positions = torch.arange(rows, device=device, dtype=torch.int64) * ratio + 1
+    sequence_lengths = torch.randint(
+        ratio, ratio * (rows + 2) + 1, (num_requests,), device=device,
+        dtype=torch.int32, generator=gen,
+    )
+    return blocks, query_positions, sequence_lengths, token_to_req
+
+
+@pytest.mark.parametrize("ratio", [1, 2, 4, 8])
+@pytest.mark.parametrize("block_topk", [0, 1, 3, 8])
+@pytest.mark.parametrize("rows", [1, 5, 64])
+def test_expand_indices_parity(ratio, block_topk, rows):
+    """HIP expansion must match the Triton reference exactly (integer op)."""
+    num_requests = 4
+    blocks, positions, seq_lens, token_to_req = _expand_inputs(
+        rows, block_topk, ratio, num_requests, seed=rows * 31 + block_topk
+    )
+    token_topk = block_topk * ratio
+    ref = qsa_ops.expand_qsa_block_indices_cuda(
+        blocks, positions, seq_lens, token_to_req, ratio, token_topk
+    )
+    hip = qsa_rdna2.qsa_expand_indices(
+        blocks, positions, seq_lens, token_to_req, ratio, token_topk
+    )
+    assert hip.shape == ref.shape == (rows, token_topk + ratio - 1)
+    assert torch.equal(hip, ref), (
+        f"rows={rows} block_topk={block_topk} ratio={ratio}\n"
+        f"ref={ref.tolist()}\nhip={hip.tolist()}"
+    )
+
+
+@pytest.mark.parametrize("rows", [0, 3])
+def test_expand_indices_empty_and_out_param(rows):
+    """Empty input returns the empty output; a supplied `out` is filled in place."""
+    ratio, block_topk, num_requests = 4, 3, 2
+    blocks, positions, seq_lens, token_to_req = _expand_inputs(
+        rows, block_topk, ratio, num_requests, seed=7
+    )
+    token_topk = block_topk * ratio
+    width = token_topk + ratio - 1
+    buf = torch.full((rows, width), -9, device=device, dtype=torch.int32)
+    ref = qsa_ops.expand_qsa_block_indices_cuda(
+        blocks, positions, seq_lens, token_to_req, ratio, token_topk, out=buf
+    )
+    buf_hip = torch.full((rows, width), -9, device=device, dtype=torch.int32)
+    hip = qsa_rdna2.qsa_expand_indices(
+        blocks, positions, seq_lens, token_to_req, ratio, token_topk, out=buf_hip
+    )
+    assert hip.data_ptr() == buf_hip.data_ptr(), "out= must be written in place"
+    assert torch.equal(hip, ref)
+
+
+def test_expand_indices_strided_blocks_parity():
+    """A non-contiguous block_indices view must follow the same strides."""
+    ratio, block_topk, rows, num_requests = 4, 4, 16, 4
+    blocks, positions, seq_lens, token_to_req = _expand_inputs(
+        rows, block_topk, ratio, num_requests, seed=11, strided=True
+    )
+    assert blocks.stride(1) == 2, "expected a non-unit column stride"
+    token_topk = block_topk * ratio
+    ref = qsa_ops.expand_qsa_block_indices_cuda(
+        blocks, positions, seq_lens, token_to_req, ratio, token_topk
+    )
+    hip = qsa_rdna2.qsa_expand_indices(
+        blocks, positions, seq_lens, token_to_req, ratio, token_topk
+    )
+    assert torch.equal(hip, ref)
+
+
+def test_expand_indices_routes_to_hip_behind_the_gate(monkeypatch):
+    """The dispatcher routes to the HIP op behind the gate.
+
+    Unlike the other QSA ops this one is integer-only, so the fp16 dtype
+    restriction does not apply -- but the env/platform gate still must.
+    """
+    seen: list[torch.dtype] = []
+    monkeypatch.setattr(
+        qsa_rdna2,
+        "qsa_expand_indices",
+        lambda *a, **kw: seen.append(a[0].dtype) or torch.empty(0),
+    )
+    monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", True)
+    monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
+    blocks, positions, seq_lens, token_to_req = _expand_inputs(4, 2, 4, 2, seed=3)
+    qsa_ops.expand_qsa_block_indices_cuda(
+        blocks, positions, seq_lens, token_to_req, 4, 8
+    )
+    assert seen == [torch.int32]
+
+    monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", False)
+    seen.clear()
+    ref = qsa_ops.expand_qsa_block_indices_cuda(
+        blocks, positions, seq_lens, token_to_req, 4, 8
+    )
+    assert seen == [], "the gate must keep int32 on Triton"
+    assert ref.dtype == torch.int32

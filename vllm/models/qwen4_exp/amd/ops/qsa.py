@@ -762,6 +762,18 @@ def expand_qsa_block_indices_cuda(
         raise ValueError("QSA expansion output has an invalid shape")
     if not block_indices.shape[0]:
         return out
+    # Integer op, so the plain gate applies: the fp16 dtype restriction that
+    # guards the other QSA ops does not apply to index expansion.
+    if qsa_rdna2.qsa_use_rdna2():
+        return qsa_rdna2.qsa_expand_indices(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
     column_block = 256
     _expand_qsa_indices_kernel[
         (block_indices.shape[0], triton.cdiv(output_width, column_block))

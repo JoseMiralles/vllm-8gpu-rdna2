@@ -138,9 +138,36 @@ def qsa_mqa_paged(
     )
 
 
+def qsa_expand_indices(
+    block_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_to_req: torch.Tensor,
+    compress_ratio: int,
+    token_topk: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Expand compressed block indices and compact the causal tail.
+
+    Mirrors the Triton ``expand_qsa_block_indices_cuda``; returns
+    ``[rows, token_topk + compress_ratio - 1]`` int32 with ``-1`` for slots
+    that are neither an expanded block entry nor a valid tail entry.
+    """
+    return ops.qsa_expand_indices_rdna2(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+        out,
+    )
+
+
 __all__ = [
     "qsa_compress_groups",
     "qsa_compress_groups_with_ratio_compat",
+    "qsa_expand_indices",
     "qsa_mqa_paged",
     "qsa_store_cache_rows",
     "qsa_store_cache_rows_compat",
