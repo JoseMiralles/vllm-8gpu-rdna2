@@ -102,6 +102,24 @@ Code: `csrc/rocm/qsa_rdna2.cu` · Dispatcher:
 `vllm/models/qwen4_exp/amd/ops/qsa_rdna2.py` · Gate:
 `VLLM_RDNA_QSA_HIP=1`
 
+**How the S5 numbers below are measured** — `tools/rdna2/bench_qsa_rdna2.py`,
+GPU 1, 50 iterations per arm, both arms through the same production
+dispatcher. It reports *two* numbers, and they disagree in sign, so be
+explicit about which one is meant:
+
+- **`kernel_us`** — summed GPU kernel time (`torch.profiler`). This is what a
+  **cudagraph-captured** decode step pays, and the only fair kernel-to-kernel
+  comparison. Use it for "is the HIP kernel faster".
+- **`call_us`** — CUDA events around a batched loop. It includes ~20 us of
+  Python + Triton launch overhead, which the HIP ops do not pay. That is what
+  a **non-cudagraph** step pays, and it flatters HIP by a wide margin.
+
+An earlier revision of this tracker quoted only `call_us` and therefore
+claimed +35.6 % / +62.9 % where the HIP kernels are actually *slower* than
+Triton. `/tmp`-style per-iteration `perf_counter() + synchronize()` loops are
+the same trap in reverse: they add an arm-dependent constant. Do not trust a
+HIP-vs-Triton delta that does not name its timer.
+
 ### qsa_store_cache_rows_rdna2
 
 - [x] **S0 build**
@@ -116,9 +134,14 @@ Code: `csrc/rocm/qsa_rdna2.cu` · Dispatcher:
   path; the `[rows, 1, width]` squeeze lives in the dispatcher's compat
   wrapper.
 - [x] **S5 bench** — production shape `(rows=512, WIDTH=128,
-  PAGE_SIZE=256)` measured on GPU 1: **16.9 us vs 26.3 us Triton
-  (+35.6 %)** against the `>= +30 %` target. At 2048 rows both kernels sit
-  at the ~25 us launch floor (+7 %). `.pi/qsa_hip_bench.py`.
+  PAGE_SIZE=256)` on GPU 1 (`tools/rdna2/bench_qsa_rdna2.py`): kernel
+  **6.0 us Triton vs 6.8 us HIP (-10.6 %)**; call-level 28.5 us vs
+  12.3 us (+57 %), i.e. entirely Triton launch overhead. So the kernel
+  misses the `>= +30 %` target and is at parity, not ahead.
+  This *was* 15.7 us (2.5x Triton): the kernel launched one row per
+  256-thread block, so only the 16 threads holding a 16-byte vector were
+  ever active. It now spans `256 / (WIDTH / 8)` rows per block, which is
+  what closed the gap.
 - [ ] **S6 default-on**
 
 ### qsa_compress_groups_rdna2
@@ -134,13 +157,14 @@ Code: `csrc/rocm/qsa_rdna2.cu` · Dispatcher:
   The gate also requires fp16 (the kernel is `half*`-only), so bf16 keeps
   Triton.
 - [x] **S3 integration** — runs in the indexer's `_update_and_compress`.
-- [x] **S5 bench** — production shape `(rows=512, head_dim=128, ratio=4)`
-  measured on GPU 1: **26.9 us vs 72.3 us Triton (+62.9 %)** against the
-  `>= +15 %` target. This is after fixing the kernel: it previously used a
-  per-thread `float acc[128]` array **and every thread in the block
-  recomputed the whole row**, which was 7-23x slower than Triton. Now one
-  thread owns one output dim with a scalar accumulator. 2048 rows:
-  +41.1 %. `.pi/qsa_hip_bench.py`.
+- [x] **S5 bench** — production shape `(rows=512, head_dim=128, ratio=4)` on
+  GPU 1: kernel **13.6 us Triton vs 17.1 us HIP (-25.6 %)**; call-level
+  73.2 us vs 29.8 us (+59 %), again Triton launch overhead. The kernel
+  therefore misses the `>= +15 %` target. It is nonetheless 7-23x faster
+  than the version this work started from, which used a per-thread
+  `float acc[128]` array **and had every thread in the block recompute the
+  whole row**; now one thread owns one output dim with a scalar
+  accumulator.
 - [x] **S5b correctness guard** — `head_dim > 128` used to be silently
   truncated to `BLOCK_D`; it is now a `TORCH_CHECK`.
 - [ ] **S6 default-on**
@@ -170,14 +194,66 @@ Code: `csrc/rocm/qsa_rdna2.cu` · Dispatcher:
   ways and the selected token sets agree. A real model forward pass with
   `VLLM_RDNA_QSA_HIP=1` is still owed (needs TP4 on the real checkpoint).
 - [x] **S5 bench** — fp16, `H` free, `D <= 128` (indexer is 4 x 128),
-  `compress_ratio = 4`, 8192 columns measured on GPU 1:
-  rows=64 **13.1 us vs 118.9 us Triton (+89.0 %)**, rows=512 **148 us vs
-  794 us (+81.3 %)**, rows=2048 **2391 us vs 3445 us (+30.6 %)**.
-  The 2048-row case is the large-prefill shape and is at hardware SOL for
-  both kernels; the dense fast path uses `v_dot2` (2 MAC/inst) when the
-  rows are contiguous with even head_dim, with a scalar fallback for
-  strided views.
+  `compress_ratio = 4`, `rows=512`, 8192 columns, GPU 1: kernel **738.7 us
+  Triton vs 73.5 us HIP (+90.0 %)**; call-level 746 us vs 231 us (+69 %).
+  This is the one QSA op where HIP wins outright, and it wins on kernel time,
+  not launch overhead: the HIP kernel skips the columns outside each row's
+  visible range, while the Triton kernel masks them but still computes them.
+  The dense fast path uses `v_dot2` (2 MAC/inst) when the rows are contiguous
+  with even head_dim, with a scalar fallback for strided views.
 - [ ] **S6 default-on** — deferred until the real-forward S3 run lands.
+
+---
+
+## GDN prefill HIP
+
+Code: `csrc/rocm/gdn_prefill_delta_h_rdna2.cu` · Dispatcher:
+`vllm/models/qwen4_exp/amd/ops/gdn_prefill_rdna2.py` · Gate:
+`VLLM_GDN_HIP_PREFILL=1`
+
+### gdn_prefill_delta_h_rdna2
+
+- [x] **S0 build**
+- [x] **S1 parity** — 30 cases in
+  `tests/kernels/quantization/test_gdn_prefill_delta_h_rdna2.py`
+  (`H,Hg ∈ {(12,4),(4,4)}` x 6 `seq_lens` x initial-state on/off). The
+  original suite was itself wrong and had to be fixed before it could say
+  anything about the kernel: it fed `g` as a *global* cumsum (the contract
+  is chunk-local, `chunk_local_cumsum_scalar_kernel` is launched per chunk)
+  and used unnormalised N(0,1) k/w, so the inter-chunk operator `I - k^T w`
+  was O(100), `|h|` grew ~30x per chunk, and the Triton reference returned
+  NaN from 4 chunks on.
+- [x] **S5 bench** — `tools/rdna2/bench_gdn_prefill_rdna2.py`, GPU 1, TP4
+  production geometry (`linear_num_value_heads=48`,
+  `linear_num_key_heads=16` -> `H=12, Hg=4`), median of 50, CUDA events:
+
+  | seq_lens | Triton us | HIP us | delta |
+  |---|---:|---:|---:|
+  | `[64,192,128]` | 229.0 | 268.4 | +17.2 % |
+  | `[4096]` | 1989.6 | 2429.9 | +22.1 % |
+  | `[2048,2048]` | 1278.8 | 2495.2 | +95.1 % |
+  | `[8192]` | 4262.0 | 5268.6 | +23.6 % |
+  | `[8192]x4` | 12727.7 | 19550.9 | +53.6 % |
+
+  So HIP is ~20 % behind at single-sequence prefill, not the 5.5 % the draft
+  PR claims, and ~2x behind when several long sequences share the batch.
+  **This is now close to the hardware wall, not a fixable bug.** Both kernels
+  are V_DOT2-issue-bound: the algorithm needs 1.6e9 `v_dot2_f32_f16`
+  (2 MAC/inst) and gfx1030 issues 1/cycle/SIMD, so ~3.9 ms at [8192] is the
+  floor. Triton sits at ~4.26 ms (92 % of that), HIP at ~5.27 ms (74 %).
+  Evidence: deleting the v-correction dot alone (halving fdot2) drops HIP to
+  3001 us; and cutting ~17 % of the loop's instructions by widening the k/w
+  loads to 128-bit changed nothing, so the kernel is not instruction-count
+  bound.
+- [x] **perf fix landed** — the loop used a live `float v_corr[GDN_BT]` (64
+  registers) across a fully unrolled 32-iteration h-update loop. That needed
+  256 VGPRs + 427 spilled + 1632 B/lane of scratch, and cost 2.3-3.3x vs
+  Triton at prefill scale. Fusing v-correction, gating and h-update into one
+  t-pair loop (v-corr only needs the pre-decay `h_fp16`, already in
+  registers) plus `#pragma unroll 8` on that loop needs 185 VGPRs and 0
+  spill.
+- [ ] **S3 integration** — a real TP4 forward pass with the gate on is owed.
+- [ ] **S6 default-on** — do not flip while the kernel is ~20 % behind.
 
 ---
 
