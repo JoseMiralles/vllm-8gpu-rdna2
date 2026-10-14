@@ -120,6 +120,51 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 # caller keeps a reference, and a later call would silently overwrite it.
 _GDN_PREFILL_SCRATCH: dict[tuple, torch.Tensor] = {}
 
+# VLLM_GDN_PREFILL_TIMING=1 turns on per-op CUDA-event timing of the HIP
+# prefill path and logs a running total. It exists because this box cannot give
+# a per-kernel view of a live server any other way: `rocprofv3 --attach` needs a
+# rocp-bg-attach thread the runtime does not create, vLLM's own profiler router
+# never flushes the worker traces, and running the server *under* rocprofv3
+# pushes a 16k prefill past 25 minutes. Off by default, and it synchronises per
+# call, so it must not be left on.
+_GDN_PREFILL_TIMING = os.environ.get("VLLM_GDN_PREFILL_TIMING", "0") == "1"
+_GDN_PREFILL_TIMING_MS: dict[str, float] = {}
+_GDN_PREFILL_TIMING_N: dict[str, int] = {}
+
+
+class _GdnPrefillTimer:
+    __slots__ = ("name", "start", "end")
+
+    def __init__(self, name):
+        self.name = name
+        self.start = self.end = None
+
+    def __enter__(self):
+        if _GDN_PREFILL_TIMING:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+            self.start.record()
+        return self
+
+    def __exit__(self, *exc):
+        if not _GDN_PREFILL_TIMING:
+            return False
+        self.end.record()
+        torch.cuda.synchronize()
+        _GDN_PREFILL_TIMING_MS[self.name] = (
+            _GDN_PREFILL_TIMING_MS.get(self.name, 0.0)
+            + self.start.elapsed_time(self.end)
+        )
+        _GDN_PREFILL_TIMING_N[self.name] = _GDN_PREFILL_TIMING_N.get(self.name, 0) + 1
+        total = _GDN_PREFILL_TIMING_N[self.name]
+        if total % 200 == 0:
+            parts = ", ".join(
+                f"{k}={v:.0f}ms/{_GDN_PREFILL_TIMING_N[k]}"
+                for k, v in sorted(_GDN_PREFILL_TIMING_MS.items())
+            )
+            logger.info("GDN prefill HIP timing (%d calls/op): %s", total, parts)
+        return False
+
 
 def _prefill_scratch(role, shape, dtype, device):
     key = (role, tuple(shape), dtype, str(device))
@@ -130,6 +175,13 @@ def _prefill_scratch(role, shape, dtype, device):
         buf = torch.zeros(shape, dtype=dtype, device=device)
         _GDN_PREFILL_SCRATCH[key] = buf
     return buf
+
+
+def _timed_call(fn, *args, **kwargs):
+    """Run fn under the GDN prefill timer (see _GdnPrefillTimer)."""
+    with _GdnPrefillTimer("prep"):
+        return fn(*args, **kwargs)
+
 
 
 def _gdn_prefill_chain_rdna2(
@@ -173,27 +225,31 @@ def _gdn_prefill_chain_rdna2(
     final_state = torch.zeros_like(initial_state)
 
     ops = torch.ops._rocm_C
-    ops.gdn_prefill_kkt_rdna2(k, beta, g_cumsum, A, cu_seqlens, chunk_indices)
-    ops.gdn_prefill_solve_wy_rdna2(
-        A, k, v, beta, g_cumsum, A_inv, w, u, cu_seqlens, chunk_indices
-    )
-    ops.gdn_prefill_delta_h_rdna2(
-        k,
-        u,
-        w,
-        g_cumsum,
-        h,
-        v_new,
-        initial_state,
-        final_state,
-        cu_seqlens,
-        chunk_offsets,
-        chunk_size,
-    )
+    with _GdnPrefillTimer("kkt"):
+        ops.gdn_prefill_kkt_rdna2(k, beta, g_cumsum, A, cu_seqlens, chunk_indices)
+    with _GdnPrefillTimer("solve_wy"):
+        ops.gdn_prefill_solve_wy_rdna2(
+            A, k, v, beta, g_cumsum, A_inv, w, u, cu_seqlens, chunk_indices
+        )
+    with _GdnPrefillTimer("delta_h"):
+        ops.gdn_prefill_delta_h_rdna2(
+            k,
+            u,
+            w,
+            g_cumsum,
+            h,
+            v_new,
+            initial_state,
+            final_state,
+            cu_seqlens,
+            chunk_offsets,
+            chunk_size,
+        )
     o = torch.empty_like(v)
-    ops.gdn_prefill_o_rdna2(
-        q, k, v_new, h, g_cumsum, o, scale, cu_seqlens, chunk_offsets
-    )
+    with _GdnPrefillTimer("o"):
+        ops.gdn_prefill_o_rdna2(
+            q, k, v_new, h, g_cumsum, o, scale, cu_seqlens, chunk_offsets
+        )
     return o, final_state
 
 
@@ -1866,20 +1922,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta_non_spec = _prefill_scratch(
                     "prep_beta", (_L, _HV), torch.float32, _dev
                 )
-                torch.ops._rocm_C.gdn_prefill_prep_rdna2(
-                    conv_output_prefill,
-                    a_prefill,
-                    b_prefill,
-                    self.A_log,
-                    self.dt_bias,
-                    query_non_spec,
-                    key_non_spec,
-                    value_non_spec,
-                    g_non_spec,
-                    beta_non_spec,
-                    attn_metadata.prefill_query_start_loc,
-                    attn_metadata.chunk_indices,
-                )
+                with _GdnPrefillTimer("prep"):
+                    torch.ops._rocm_C.gdn_prefill_prep_rdna2(
+                        conv_output_prefill,
+                        a_prefill,
+                        b_prefill,
+                        self.A_log,
+                        self.dt_bias,
+                        query_non_spec,
+                        key_non_spec,
+                        value_non_spec,
+                        g_non_spec,
+                        beta_non_spec,
+                        attn_metadata.prefill_query_start_loc,
+                        attn_metadata.chunk_indices,
+                    )
             else:
                 (
                     query_non_spec,
@@ -1887,7 +1944,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     value_non_spec,
                     g_non_spec,
                     beta_non_spec,
-                ) = fused_post_conv_prep(
+                ) = _timed_call(fused_post_conv_prep,
                     conv_output=conv_output_prefill,
                     a=a_prefill,
                     b=b_prefill,
@@ -1974,37 +2031,38 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = (
-                _gdn_prefill_chain_rdna2(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g_cumsum=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    scale=self.head_k_dim**-0.5,
-                    cu_seqlens=attn_metadata.prefill_query_start_loc,
-                    chunk_indices=attn_metadata.chunk_indices,
-                    chunk_offsets=attn_metadata.chunk_offsets,
+            with _GdnPrefillTimer("chain"):
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = (
+                    _gdn_prefill_chain_rdna2(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g_cumsum=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        scale=self.head_k_dim**-0.5,
+                        cu_seqlens=attn_metadata.prefill_query_start_loc,
+                        chunk_indices=attn_metadata.chunk_indices,
+                        chunk_offsets=attn_metadata.chunk_offsets,
+                    )
+                    if _gdn_prefill_dispatch_available()
+                    else self.chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=attn_metadata.prefill_query_start_loc,
+                        chunk_indices=attn_metadata.chunk_indices,
+                        chunk_offsets=attn_metadata.chunk_offsets,
+                        use_qk_l2norm_in_kernel=False,
+                    )
                 )
-                if _gdn_prefill_dispatch_available()
-                else self.chunk_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=attn_metadata.prefill_query_start_loc,
-                    chunk_indices=attn_metadata.chunk_indices,
-                    chunk_offsets=attn_metadata.chunk_offsets,
-                    use_qk_l2norm_in_kernel=False,
-                )
-            )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
