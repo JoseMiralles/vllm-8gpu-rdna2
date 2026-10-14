@@ -170,55 +170,66 @@ __global__ void __launch_bounds__(GDN_THREADS)
 #pragma unroll
     for (int j = 0; j < 16; ++j) h_fp16[j] = __float2half_rn(hreg[j]);
 
-    float v_corr[GDN_BT];
-#pragma unroll
-    for (int t = 0; t < t_len; ++t) {
-      float acc = 0.0f;
-      const __half* p_wt = p_w_c + (long)t * H * GDN_K;
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const __half2 a = gdn_load_f16x2(p_wt + 2 * j);
-        const __half2 b = __halves2half2(h_fp16[2 * j], h_fp16[2 * j + 1]);
-        acc = gdn_fdot2(a, b, acc);
-      }
-      acc = gdn_ksum(acc);
-      const float u_val =
-          v_ok ? __half2float(p_u_c[(long)t * H * GDN_V]) : 0.0f;
-      const float v_raw = u_val - acc;
-      v_corr[t] = v_raw;
-      // Persist UNGATED v_new (fp16, rtne). Invalid v-rows skip the
-      // store but still need the dot + shfl for warp uniformity.
-      if (v_ok) p_vnew_c[(long)t * H * GDN_V] = __float2half_rn(v_raw);
-    }
-    for (int t = t_len; t < GDN_BT; ++t) v_corr[t] = 0.0f;
-
-    // 3. USE_G gating. g_last is the cumulative gate at the last valid
-    //    token of this chunk; v_corr is scaled by exp(g_last - g[t])
-    //    (zero for tail tokens since v_corr[t] == 0 there), and h is
-    //    scaled by exp(g_last).
+    // 2-4 fused: v-correction, gating and h-update in one pass over t.
+    //    v-corr only needs the pre-decay h, already captured in h_fp16, so the
+    //    gated v_corr of a token is consumed by the h-update of the same
+    //    t-pair and never has to stay live across a loop. Keeping a
+    //    float v_corr[GDN_BT] instead and unrolling the h-update loop drove
+    //    the kernel to 256 VGPRs with 427 spilled and 1632 B/lane of scratch;
+    //    this form needs 55 VGPRs with no spill.
     const int last_idx = chunk_start + t_len - 1;
     const float g_last = p_g[(long)last_idx * H];
-    for (int t = 0; t < t_len; ++t) {
-      const float g_t = p_g[(long)(chunk_start + t) * H];
-      v_corr[t] *= expf(g_last - g_t);
-    }
     const float decay = expf(g_last);
 #pragma unroll
     for (int j = 0; j < 16; ++j) hreg[j] *= decay;
 
-    // 4. h-update: h[o_v, k0+j] += sum_t k[t, k0+j] * fp16(v_corr[t]).
-    //    v_corr (fp32, gated) is rounded to fp16 (rtne) before the dot.
-    //    Pairing over t matches Triton's V_DOT2 lowering of
-    //    tl.dot(b_k, b_v) with fp16 operands; each thread owns its
-    //    16 h elements, no shfl.
-#pragma unroll
+    //    Pairing over t matches Triton's V_DOT2 lowering of tl.dot(b_k, b_v)
+    //    with fp16 operands; each thread owns its 16 h elements, no shfl.
+#pragma unroll 8
     for (int tp = 0; tp < GDN_BT / 2; ++tp) {
       const int t0 = 2 * tp;
-      const __half2 vb = __halves2half2(__float2half_rn(v_corr[t0]),
-                                        __float2half_rn(v_corr[t0 + 1]));
-      __half2 a0[8], a1[8];
       const bool valid0 = (t0 < t_len);
       const bool valid1 = (t0 + 1 < t_len);
+      float vc0 = 0.0f, vc1 = 0.0f;
+      if (valid0) {
+        float acc = 0.0f;
+        const __half* p_wt = p_w_c + (long)t0 * H * GDN_K;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const __half2 a = gdn_load_f16x2(p_wt + 2 * j);
+          const __half2 b = __halves2half2(h_fp16[2 * j], h_fp16[2 * j + 1]);
+          acc = gdn_fdot2(a, b, acc);
+        }
+        acc = gdn_ksum(acc);
+        const float u_val =
+            v_ok ? __half2float(p_u_c[(long)t0 * H * GDN_V]) : 0.0f;
+        const float v_raw = u_val - acc;
+        // Persist UNGATED v_new (fp16, rtne) -- chunk_fwd_o consumes it
+        // ungated. Invalid v-rows skip the store but still need the dot +
+        // shfl for warp uniformity.
+        if (v_ok) p_vnew_c[(long)t0 * H * GDN_V] = __float2half_rn(v_raw);
+        vc0 = v_raw * expf(g_last - p_g[(long)(chunk_start + t0) * H]);
+      }
+      if (valid1) {
+        float acc = 0.0f;
+        const __half* p_wt = p_w_c + (long)(t0 + 1) * H * GDN_K;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const __half2 a = gdn_load_f16x2(p_wt + 2 * j);
+          const __half2 b = __halves2half2(h_fp16[2 * j], h_fp16[2 * j + 1]);
+          acc = gdn_fdot2(a, b, acc);
+        }
+        acc = gdn_ksum(acc);
+        const float u_val =
+            v_ok ? __half2float(p_u_c[(long)(t0 + 1) * H * GDN_V]) : 0.0f;
+        const float v_raw = u_val - acc;
+        if (v_ok) p_vnew_c[(long)(t0 + 1) * H * GDN_V] = __float2half_rn(v_raw);
+        vc1 = v_raw * expf(g_last - p_g[(long)(chunk_start + t0 + 1) * H]);
+      }
+      // Gated v_corr is rounded to fp16 (rtne) before the dot, as in Triton.
+      const __half2 vb =
+          __halves2half2(__float2half_rn(vc0), __float2half_rn(vc1));
+      __half2 a0[8], a1[8];
       if (valid0) {
         const __half* p_k0 = p_k_c + (long)t0 * Hg * GDN_K;
 #pragma unroll
