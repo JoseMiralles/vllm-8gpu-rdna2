@@ -29,6 +29,53 @@ whenever a kernel moves between stages.
 | **S5 bench** | HIP throughput ≥ Triton (or justified slower) | Bench numbers logged in `qwen4_exp_hip_path.md` |
 | **S6 default-on** | Flip env-var default to "1" + remove `VLLM_DISABLED_KERNELS` parallel | All tests pass with default-on |
 
+## S3 serving A/B — the gates measured end to end (2026-10-13)
+
+`tools/rdna2/bench_serve_gates_ab.sh`, production server
+(`tools/rdna2/serve_v620_stable.sh`, TP4/EP4 + MTP2, Uncensored W4A16, KV=4026531840),
+one fresh server process per arm (both gates are read at import time), same
+box and session, `vllm bench serve` with `--dataset-name random --seed 0
+--max-concurrency 1 --ignore-eos`. Four arms:
+
+| arm | `VLLM_RDNA_QSA_HIP` | `VLLM_GDN_HIP_PREFILL` |
+|---|---|---|
+| A | 0 | 0 |
+| C (A repeat) | 0 | 0 |
+| D | 0 | 1 |
+| B | 1 | 1 |
+
+| metric | A | C | D (GDN) | B (both) | D vs off | B vs off |
+|---|---:|---:|---:|---:|---:|---:|
+| prefill 8k, total tok/s | 1737.5 | 1709.1 | 1630.8 | 1624.0 | **-5.4 %** | -5.8 % |
+| prefill 16k, total tok/s | 1809.6 | 1801.2 | 1697.7 | 1705.7 | **-6.0 %** | -5.5 % |
+| prefill 16k, TTFT p50 ms | 9555.2 | 9624.3 | 10125.7 | 10139.6 | **+5.6 %** | +5.7 % |
+| decode 128+256, TPOT p50 ms | 11.83 | 11.81 | 11.60 | 10.67 | -1.9 % | **-9.7 %** |
+
+The two off-arms agree to 0.5-1.7 % on prefill and 0.2 % on TPOT, so the
+differences above are real at this workload.
+
+**What this says**
+
+1. **`VLLM_GDN_HIP_PREFILL=1` costs ~5.5 % prefill and buys nothing.** D and B
+   are indistinguishable on prefill, so the whole regression is GDN, and QSA
+   contributes nothing measurable there. Decode is unaffected by D, as
+   expected (no GDN prefill in a decode step).
+2. **Almost none of that 5.5 % is `delta_h`.** The delta_h kernel is +1.0 ms
+   per layer at 8k prefill (4262 vs 5269 us) over 36 GDN layers = ~36 ms of a
+   ~9.6 s prefill, i.e. ~0.4 %. The other ~5 % is in
+   `gdn_prefill_{prep,kkt,solve_wy,o}_rdna2`, which nobody has profiled yet.
+   **That is the next thing to look at**, and it is the reason the draft PR's
+   "-8.7 % on a 16k prefill" survives despite delta_h being fixed.
+3. **`VLLM_RDNA_QSA_HIP=1` buys ~9.7 % decode TPOT for free.** D vs B on decode
+   isolates it (11.60 vs 10.67 ms); prefill is unchanged within noise. At the
+   row counts a decode step actually uses, this is *not* the `mqa_paged` win
+   measured at rows=512 — those shapes do not occur in decode — so the cause is
+   still unidentified and is worth its own profile.
+
+Caveat: the repo's own notes record ~10 % session-to-session drift on these
+serving numbers, so only the within-session A/B above is meaningful, and it is
+one workload (concurrency 1, no prefix-cache hits).
+
 ---
 
 ## HC prefill HIP
@@ -189,10 +236,11 @@ HIP-vs-Triton delta that does not name its timer.
   `vllm/models/qwen4_exp/amd/ops/qsa.py` now routes to the HIP op behind
   `qsa_use_rdna2(q.dtype)`; bf16 keeps Triton because the HIP kernels are
   fp16-only.
-- [~] **S3 integration** — wired; `test_dispatched_indexer_selection_matches_gate_off`
+- [x] **S3 integration** — wired; `test_dispatched_indexer_selection_matches_gate_off`
   drives the full `qsa_select_paged_tokens` (score -> top-k -> expand) both
-  ways and the selected token sets agree. A real model forward pass with
-  `VLLM_RDNA_QSA_HIP=1` is still owed (needs TP4 on the real checkpoint).
+  ways and the selected token sets agree. A real TP4 forward pass with
+  `VLLM_RDNA_QSA_HIP=1` now also runs (see the S3 serving A/B section):
+  decode TPOT p50 11.82 -> 10.67 ms, prefill unchanged within noise.
 - [x] **S5 bench** — fp16, `H` free, `D <= 128` (indexer is 4 x 128),
   `compress_ratio = 4`, `rows=512`, 8192 columns, GPU 1: kernel **738.7 us
   Triton vs 73.5 us HIP (+90.0 %)**; call-level 746 us vs 231 us (+69 %).
@@ -252,8 +300,13 @@ Code: `csrc/rocm/gdn_prefill_delta_h_rdna2.cu` · Dispatcher:
   t-pair loop (v-corr only needs the pre-decay `h_fp16`, already in
   registers) plus `#pragma unroll 8` on that loop needs 185 VGPRs and 0
   spill.
-- [ ] **S3 integration** — a real TP4 forward pass with the gate on is owed.
-- [ ] **S6 default-on** — do not flip while the kernel is ~20 % behind.
+- [x] **S3 integration** — real TP4 forward pass with
+  `VLLM_GDN_HIP_PREFILL=1` runs clean, but it costs **~5.5 % prefill**
+  (1705.7 vs 1805.4 tok/s at 16k) and buys nothing on decode. See the S3
+  serving A/B section. delta_h itself accounts for only ~0.4 % of that, so
+  the rest is in the other four GDN prefill kernels.
+- [ ] **S6 default-on** — do not flip: the gate is a measured 5.5 % prefill
+  regression and the remaining kernels have not been profiled.
 
 ---
 
@@ -332,23 +385,28 @@ Code: `csrc/rocm/ple_short_conv_rdna2.cu` · Dispatcher:
 
 ## Next actions (priority-ordered)
 
-1. **[S0 build]** Rebuild `_rocm_C.abi3.so` against the new
-   `csrc/rocm/*_rdna2.cu` files. Verify with the
-   `test_rdna_hip_build_smoke` probe.
-2. **[S1 parity]** Land the HC parity tests first (smallest kernels,
-   fastest signal). Use a low-shape parametrize matrix for the first
-   CI run, expand to production shapes after.
-3. **[S1 parity]** Land the QSA `qsa_store_cache_rows` parity test
-   (pure scatter — no math, only a stride contract to verify).
-4. **[S1 parity]** Land the PLE conv decode parity test (most
-   complex of the decode paths; non-trivial state write-back
-   semantics).
-5. **[S5 bench]** Run a small set of production-shape benches
-   against the current Triton reference on `.176`. Target: ≥ +20%
-   on every kernel; if a kernel is slower, leave it gated
-   (`VLLM_DISABLED_KERNELS` analog) and document why.
-6. **[S6 default-on]** Flip env-var defaults from "0" to "1" one
-   family at a time, on a release branch.
+1. **[S5 bench, highest value]** Profile
+   `gdn_prefill_{prep,kkt,solve_wy,o}_rdna2` the way delta_h was profiled.
+   The gates-on prefill is ~5.5 % slower and delta_h explains only ~0.4 % of
+   it, so ~5 % is sitting in those four kernels. Each has a parity test
+   already (`tests/kernels/quantization/test_gdn_prefill_*_rdna2.py`), so a
+   bench harness is cheap. A V_DOT2/instruction-count analysis like the one
+   in the GDN section is the fastest way to tell "bug" from "wall".
+2. **[S5 bench]** Find what makes `VLLM_RDNA_QSA_HIP=1` worth ~9.7 % decode
+   TPOT. The rows=512 `mqa_paged` win does not occur at decode row counts, so
+   the cause is something else in the QSA decode path — profile a decode step
+   with the gate on/off rather than guessing from the op benches.
+3. **[S5 bench]** `compress_groups` is 25.6 % slower than Triton at the kernel
+   level and nobody has looked at why.
+4. **[S3]** Re-run the serving A/B at higher concurrency and with prefix-cache
+   hits; the numbers here are concurrency-1 and zero-cache.
+5. **[S6 default-on]** `VLLM_RDNA_QSA_HIP` is the only gate with a measured
+   win (decode). `VLLM_GDN_HIP_PREFILL` is a measured 5.5 % prefill loss —
+   leave both at "0" until items 1 and 2 land.
+6. **[env]** The `TUNABLEOP_PROFILE=rocm10-rocblas5.6` pin in the production
+   launcher now hard-fails (loaded rocBLAS hashes to `d05939967b5f`). Either
+   re-register the new build's profile or drop the pin; production currently
+   only starts with `TUNABLEOP_PROFILE=`.
 
 ---
 
@@ -478,17 +536,18 @@ Changes:
 - `csrc/rocm/ops.h`, `csrc/rocm/torch_bindings.cpp`, `vllm/_custom_ops.py`:
   new `qsa_mqa_paged_rdna2` schema returning `(logits, visible_blocks)`.
 
-Measured on GPU 1 (`.pi/qsa_hip_bench.py`, 200 iters, fp16):
+Measured on GPU 1 — **kernel time**, `tools/rdna2/bench_qsa_rdna2.py`
+(fp16). The call-level numbers this entry originally quoted were ~20 us of
+Triton launch overhead, not kernel time; see the methodology note in the QSA
+section:
 
-| op | shape | Triton | HIP | delta | target |
-|---|---|---:|---:|---:|---|
-| `store_cache_rows` | rows=512, w=128 | 26.3 us | 16.9 us | **+35.6 %** | >= +30 % |
-| `compress_groups` | rows=512, d=128, r=4 | 72.3 us | 26.9 us | **+62.9 %** | >= +15 % |
-| `mqa_paged` | rows=512, cols=8192 | 794 us | 148 us | **+81.3 %** | n/a |
-| `mqa_paged` | rows=2048, cols=8192 | 3445 us | 2391 us | **+30.6 %** | n/a |
+| op | shape | Triton | HIP | delta |
+|---|---|---:|---:|---:|
+| `store_cache_rows` | rows=512, w=128 | 6.0 us | 6.8 us | -10.6 % |
+| `compress_groups` | rows=512, d=128, r=4 | 13.6 us | 17.1 us | -25.6 % |
+| `mqa_paged` | rows=512, cols=8192 | 738.7 us | 73.5 us | **+90.0 %** |
 
-Still open: S3 for the real model (needs TP4 — the checkpoints are 82-169 GB
-and a full repro would need GPU 0, which is held by another agent), and S6
-default-on. The `compress_groups` bench is the most likely source of the
-previously reported "HIP QSA is 4-10 % slower overall": 12 full-attention
-layers x ~0.4 ms saved per step at 512 rows is ~5 ms of a ~90 ms TPOT.
+Superseded on 2026-10-13: S3 is done (see the S3 serving A/B section) —
+`VLLM_RDNA_QSA_HIP=1` is worth ~9.7 % decode TPOT, and
+`VLLM_GDN_HIP_PREFILL=1` costs ~5.5 % prefill. Both defaults stay "0" until
+the remaining GDN prefill kernels are profiled.
