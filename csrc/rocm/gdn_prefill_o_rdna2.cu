@@ -41,6 +41,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <hip/hip_runtime.h>  // hipFuncSetAttribute for the dynamic-LDS opt-in
 #include <type_traits>
 
 namespace {
@@ -71,12 +72,15 @@ constexpr int GDN_LDS_H_BYTES = GDN_BV * GDN_K * 2;  //  8192 (s_h [BV,K] fp16)
 constexpr int GDN_LDS_V_BYTES =
     GDN_BT * GDN_BV * 2;                  //  4096 (s_v_T [BV,BT] fp16)
 constexpr int GDN_LDS_G_FLOATS = GDN_BT;  // 64 * 4 = 256 bytes
-// s_bA [BT,BT] fp32 = 16384 bytes reuses s_q's former 16384-byte slot, so
-// the LDS budget never grows. We allocate s_q and s_bA at the same
-// offset and use them in sequence (separated by __syncthreads()).
+constexpr int GDN_LDS_BA_BYTES = GDN_BT * GDN_BT * 4;  // 16384 (s_bA fp32)
+// s_bA gets its own slot. It MUST NOT alias s_q: the compiler cannot see that
+// the __half* s_q and float* s_bA views of the extern LDS buffer overlap, and
+// the resulting alias-analysis failure makes the s_q reads of the q @ h^T dot
+// nondeterministically race the s_bA store.
 constexpr int GDN_LDS_TOTAL_BYTES = GDN_LDS_Q_BYTES + GDN_LDS_K_BYTES +
                                     GDN_LDS_H_BYTES + GDN_LDS_V_BYTES +
-                                    GDN_LDS_G_FLOATS * sizeof(float);
+                                    GDN_LDS_G_FLOATS * sizeof(float) +
+                                    GDN_LDS_BA_BYTES;
 
 // V_DOT2_F32_F16 helper: a.x*b.x + a.y*b.y + acc (native RDNA2).
 __device__ __forceinline__ float gdn_fdot2(half2 a, half2 b, float acc) {
@@ -110,8 +114,9 @@ __device__ __forceinline__ void gdn_lds_load(__half* dst, const HT* src,
 #pragma unroll
     for (int s = 0; s < HALF2_PER_THREAD; ++s) {
       const int idx = s * GDN_THREADS + threadIdx.x;
-      const int row = idx / (COLS / 2);
-      const long loff = (long)row * COLS;
+      // idx enumerates every half2 slot of the tile exactly once, so this
+      // zeroes the whole tile (the previous form only cleared columns 0,1).
+      const long loff = (long)idx * 2;
       dst[loff] = __float2half(0.0f);
       dst[loff + 1] = __float2half(0.0f);
     }
@@ -252,8 +257,8 @@ gdn_prefill_o_rdna2_kernel(
   const float* p_g = g_cumsum + (long)bos * stride_g_tok + (long)i_h;
   const HT* p_h = h + (long)i_tg * stride_h_chunk + (long)i_h * V * GDN_K;
 
-  // LDS staging buffers. s_bA aliases s_q's slot; reused after q @ k^T
-  // and q @ h^T are done. s_v is the transposed [BV, BT] view of v.
+  // LDS staging buffers. s_bA has its own slot (see GDN_LDS_BA_BYTES); s_v
+  // is the transposed [BV, BT] view of v.
   extern __shared__ __half smem[];
   __half* s_q = smem;                                            // [BT, K]
   __half* s_k = smem + (GDN_LDS_Q_BYTES / 2);                    // [BT, K]
@@ -264,8 +269,10 @@ gdn_prefill_o_rdna2_kernel(
       reinterpret_cast<float*>(smem + (GDN_LDS_Q_BYTES + GDN_LDS_K_BYTES +
                                        GDN_LDS_H_BYTES + GDN_LDS_V_BYTES) /
                                           2);    // [BT] fp32 (per-row)
-  float* s_bA = reinterpret_cast<float*>(smem);  // [BT, BT] fp32 (s_q's slot)
-
+  float* s_bA = reinterpret_cast<float*>(
+      smem + (GDN_LDS_Q_BYTES + GDN_LDS_K_BYTES + GDN_LDS_H_BYTES +
+              GDN_LDS_V_BYTES + GDN_LDS_G_FLOATS * (int)sizeof(float)) /
+                  2);  // [BT, BT] fp32
   // Per-thread sub-block accumulators.
   float bA[GDN_AROW][GDN_ACOL];
 #pragma unroll
@@ -597,7 +604,12 @@ void gdn_prefill_o_rdna2(
   dim3 grid((V + GDN_BV - 1) / GDN_BV, NT, B * H);
   const size_t smem_bytes = GDN_LDS_TOTAL_BYTES;
 
+// GDN_LDS_TOTAL_BYTES (61696) exceeds the default dynamic-LDS budget, so opt
+// in explicitly. Mirrors the pattern in fa_rdna2.cu.
 #define GDN_O_LAUNCH(HT)                                                     \
+  hipFuncSetAttribute(                                                       \
+      reinterpret_cast<const void*>(gdn_prefill_o_rdna2_kernel<HT>),          \
+      hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);           \
   gdn_prefill_o_rdna2_kernel<HT><<<grid, GDN_THREADS, smem_bytes, stream>>>( \
       reinterpret_cast<const __half*>(q.data_ptr()),                         \
       reinterpret_cast<const __half*>(k.data_ptr()),                         \
