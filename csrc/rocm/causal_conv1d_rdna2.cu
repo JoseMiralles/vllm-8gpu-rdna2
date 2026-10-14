@@ -139,8 +139,11 @@ void causal_conv1d_update_rdna2(
 
   const int batch = x.size(0);
   const int dim = x.size(1);
-  const int state_len = conv_state.size(2);
   const int width = weight.size(1);
+  // MTP sizes the conv state as width - 1 + num_spec; the convolution only ever
+  // consumes the first width - 1 columns, exactly like the Triton kernel's
+  // effective state_len, so the extra capacity is ignored here too.
+  const int state_len = width - 1;
   const int num_cache_lines = conv_state.size(0);
   // Python may pass torch.empty(0, dtype=...) for None bias. Such tensors
   // have defined()==true but numel()==0; data_ptr() returns a pointer to
@@ -151,9 +154,10 @@ void causal_conv1d_update_rdna2(
   TORCH_CHECK(dim % CONV1D_WARP_SIZE == 0,
               "causal_conv1d_update_rdna2 requires dim % 32 == 0, got ", dim);
   TORCH_CHECK(
-      width == state_len + 1,
-      "causal_conv1d_update_rdna2 requires width == state_len + 1, got width=",
-      width, " state_len=", state_len);
+      conv_state.size(2) >= width - 1,
+      "causal_conv1d_update_rdna2 requires conv_state.size(2) >= width - 1, got "
+      "capacity=",
+      conv_state.size(2), " width=", width);
   TORCH_CHECK(state_len > 0 && state_len <= CONV1D_UPDATE_MAX_STATE_LEN,
               "causal_conv1d_update_rdna2 supports state_len 1..",
               CONV1D_UPDATE_MAX_STATE_LEN, ", got ", state_len);
@@ -380,7 +384,9 @@ void causal_conv1d_fwd_rdna2(
 
   const int dim = x.size(0);
   const int width = weight.size(1);
-  const int state_len = conv_state.size(2);
+  // MTP sizes the conv state as width - 1 + num_spec; only the first width - 1
+  // columns are read and written, matching the Triton kernel's state_len.
+  const int state_len = width - 1;
   const int num_cache_lines = conv_state.size(0);
   const int batch = query_start_loc.size(0) - 1;
   // Python may pass torch.empty(0, dtype=...) for None bias/has_initial_state.
@@ -397,9 +403,10 @@ void causal_conv1d_fwd_rdna2(
               "causal_conv1d_fwd_rdna2 requires 2 <= width <= ",
               CONV1D_FWD_MAX_WIDTH, ", got ", width);
   TORCH_CHECK(
-      width == state_len + 1,
-      "causal_conv1d_fwd_rdna2 requires width == state_len + 1, got width=",
-      width, " state_len=", state_len);
+      conv_state.size(2) >= width - 1,
+      "causal_conv1d_fwd_rdna2 requires conv_state.size(2) >= width - 1, got "
+      "capacity=",
+      conv_state.size(2), " width=", width);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();

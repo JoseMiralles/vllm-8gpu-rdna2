@@ -733,9 +733,10 @@ def causal_conv1d_fn(
         and is_channel_last
         and dim % 32 == 0
         and 2 <= width <= 5
-        # HIP fwd requires state_len == width - 1; spec decoding sizes the
-        # conv state as width - 1 + num_spec, so fall back to Triton there.
-        and conv_states.size(2) == width - 1
+        # The HIP kernel consumes the first width - 1 state columns, like the
+        # Triton kernel's effective state_len, so a spec-sized (MTP) cache with
+        # extra capacity is fine as long as it holds at least width - 1.
+        and conv_states.size(2) >= width - 1
         and cache_indices is not None
         and block_idx_last_scheduled_token is None
         and hasattr(torch.ops, "_rocm_C")
@@ -1295,9 +1296,9 @@ def causal_conv1d_update(
         and weight.dtype == torch.float16
         and (out.dtype == torch.float16 if out is not None else True)
         and dim % 32 == 0
-        # Same spec-state guard as the fwd dispatch: HIP update requires
-        # state_len == width - 1, so Triton handles the spec-sized state.
-        and conv_state.size(2) == width - 1
+        # Same as the fwd dispatch: the HIP update uses the first width - 1
+        # state columns, so a spec-sized cache with extra capacity is fine.
+        and conv_state.size(2) >= width - 1
         and hasattr(torch.ops, "_rocm_C")
         and hasattr(torch.ops._rocm_C, "causal_conv1d_update_rdna2")
     ):
