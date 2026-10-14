@@ -528,6 +528,31 @@ favour** (the first decode reading that is not obviously noise-dominated).
 c=8 TTFT is 35.7 s at 8k and 66.6-67.2 s at 16k (8 concurrent 16k prompts), and
 TPOT rises from ~11-12 ms at c=1 to ~44 ms at c=8.
 
+#### Round 17 — the 1k shapes from #64's validation list
+
+PR #64 asks for "16k/1k + 1k/512 c=1/c=8 prefill/decode/TTFT/ITL". 8k/16k
+prefill and 128->256 decode were already done; these are the two missing shapes.
+Three arms, all health 200, `--ignore-eos`:
+
+| shape | off (1st) | on | off (3rd) |
+|---|---:|---:|---:|
+| 1k prefill, n=64, c=1 | 1688.1 tok/s | 1682.0 | 1688.7 |
+| 1k prefill, n=64, c=8 | 1900.7 tok/s | 1862.8 | 1888.7 |
+| 1k -> 512 decode, n=8, c=1 | 227.8 tok/s | 233.5 | 213.2 |
+| **1k -> 512 decode, n=8, c=8** | 430.4 tok/s | **479.5** | 410.0 |
+| decode TPOT p50, c=8 | 42.48 ms | **41.58** | 47.15 |
+| decode TTFT p50, c=8 | 4612 ms | 2904 | 2921 |
+
+1k prefill is the usual parity-within-noise (-0.38 % at c=1, -1.68 % at c=8,
+against an off-arm spread of ~0.7 % at c=8).
+
+**The c=8 decode row is the first signal that is not obviously noise**: the gates
+beat *both* off arms by +11 % and +17 % throughput, with the best TPOT and TTFT
+at parity. But the two off arms differ from each other by 5 % throughput and
+11 % TPOT, so single samples cannot settle it. That is being tested with 6
+repeats per arm inside one server lifetime (removing the model-load component
+that dominates the between-arm spread).
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
