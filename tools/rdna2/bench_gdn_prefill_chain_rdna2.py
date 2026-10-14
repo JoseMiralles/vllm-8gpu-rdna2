@@ -231,7 +231,11 @@ def kernel_arms(d):
 
 def main():
     out = {"device": torch.cuda.get_device_name(0)}
-    for label, T, n_seq in (("prefill_8k", 8192, 1),
+    # 1024/2048 are the served prefill chunks (--max-num-batched-tokens 2048);
+    # 8k/16k are the long-context chunked-prefill sizes.
+    for label, T, n_seq in (("prefill_1k", 1024, 1),
+                            ("prefill_2k", 2048, 1),
+                            ("prefill_8k", 8192, 1),
                             ("prefill_16k", 16384, 1),
                             ("prefill_16k_x2", 16384, 2)):
         d = make_inputs(T, n_seq=n_seq)

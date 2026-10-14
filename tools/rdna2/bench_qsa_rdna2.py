@@ -95,26 +95,41 @@ def bench_mqa(rows=512, heads=4, head_dim=128, num_pages=64, page_size=256,
     )
 
 
+def bench_expand(rows=512, block_topk=512, ratio=4, num_requests=8):
+    """Model geometry: indexer_budget 2048 / compress_ratio 4 -> block_topk 512."""
+    a = T._expand_inputs(rows, block_topk, ratio, num_requests, seed=rows)
+    return lambda: qsa_ops.expand_qsa_block_indices_cuda(
+        a[0], a[1], a[2], a[3], ratio, block_topk * ratio
+    )
+
+
+# Prefill chunks of the served batch (--max-num-batched-tokens 2048) plus the
+# MTP-verify sizes the decode step pays for.
+ROWS = (3, 6, 12, 24, 64, 256, 512, 1024, 2048)
+
+
 def main():
     print(f"{'op':<44}{'call_us':>18}{'kernel_us':>20}")
     for name, mk in (
-        ("store_cache_rows rows=512 w=128", bench_store),
-        ("compress_groups rows=512 d=128 r=4", bench_compress),
-        ("mqa_paged rows=512 cols=8192", bench_mqa),
+        ("store_cache_rows w=128", bench_store),
+        ("compress_groups d=128 r=4", bench_compress),
+        ("mqa_paged cols=8192", bench_mqa),
+        ("expand_indices block_topk=512", bench_expand),
     ):
-        row = {}
-        for gate in (False, True):
-            set_gate(gate)
-            fn = mk()
-            fn()
-            torch.cuda.synchronize()
-            row[gate] = (call_us(fn), kernel_us(fn))
-        (c0, k0), (c1, k1) = row[False], row[True]
-        print(
-            f"{name:<44}"
-            f"{c0:8.2f} -> {c1:7.2f}  {100 * (c0 - c1) / c0:+5.1f}%"
-            f"{k0:8.2f} -> {k1:7.2f}  {100 * (k0 - k1) / k0:+5.1f}%"
-        )
+        for rows in ROWS:
+            row = {}
+            for gate in (False, True):
+                set_gate(gate)
+                fn = mk(rows=rows)
+                fn()
+                torch.cuda.synchronize()
+                row[gate] = (call_us(fn), kernel_us(fn))
+            (c0, k0), (c1, k1) = row[False], row[True]
+            print(
+                f"{name + f' rows={rows}':<44}"
+                f"{c0:8.2f} -> {c1:7.2f}  {100 * (c0 - c1) / c0:+5.1f}%"
+                f"{k0:8.2f} -> {k1:7.2f}  {100 * (k0 - k1) / k0:+5.1f}%"
+            )
 
 
 if __name__ == "__main__":
