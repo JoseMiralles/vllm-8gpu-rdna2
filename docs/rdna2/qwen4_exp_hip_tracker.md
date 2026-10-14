@@ -350,6 +350,41 @@ GDN deficit disappears; if it does, the cause is the compiled graph around the
 GDN region and not the kernels, which every isolated measurement already says
 are faster.
 
+#### Round 12 — `-O0` refutes the compiled-graph hypothesis and decomposes the residue
+
+`--enforce-eager` aborts this model at load, but `--compilation-config.mode=0`
+(`-O0`) starts fine, so the compiled-graph hypothesis could finally be tested.
+Both arms run back-to-back in one script, same shapes:
+
+| arm | prefill 8k tok/s | prefill 16k tok/s |
+|---|---:|---:|
+| off | 1736.7 | 1809.0 |
+| on | 1708.3 (-1.6 %) | 1789.8 (-1.1 %) |
+
+**The deficit is the same with and without the inductor graph**, so the compiled
+graph around the GDN region is *not* the cause. Hypothesis refuted.
+
+That result also **decomposes the residue**. The clean in-server probe says the
+GDN path is **+0.5 %** (1.40 vs 1.57 ms/call x 288 chunks = 49 ms of a 9.55 s
+prefill). Both gates together measure **-1.1 %**. So
+
+  GDN +0.5 %  and  both -1.1 %   =>   **QSA ~ -1.6 %**
+
+which is the largest single contributor and is *not* explained by the QSA op
+benches (at prefill row counts `store_cache_rows` is -25/-58 %,
+`compress_groups` +14.5/+9.4 %, dense `mqa_paged` -10 % — all at or better than
+Triton). The earlier "QSA-only -0.6 %" was a cross-session comparison and is
+superseded by this arithmetic.
+
+**Leading hypothesis for the QSA cost, not yet tested:** the HIP indexer does not
+just change which *kernels* run, it changes the *selected token set*. HIP logits
+differ from Triton's (different summation order) and it emits its own
+`visible_blocks`, so the top-k / expand step can select a different number of
+tokens and the Triton sparse-attention kernels downstream then do a different
+amount of work — a cost that appears outside every QSA op bench. Test by timing
+the sparse-attention kernels in both arms, or by comparing the token counts the
+indexer returns.
+
 #### What the remaining -1.9 % is not
 
 - **Not the GDN chain.** All five kernels now sum to +4.5 % at 16k (was +75 %),
