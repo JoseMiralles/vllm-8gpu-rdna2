@@ -64,20 +64,7 @@ __global__ void qsa_store_cache_rows_kernel(
     int64_t stride_rows_row, int64_t stride_rows_dim,
     int64_t stride_cache_block, int64_t stride_cache_token,
     int64_t stride_cache_dim,
-    int PAGE_SIZE, int WIDTH, int elem_bytes) {
-  const int row = blockIdx.x;
-  if (row >= num_rows) return;
-  const int64_t slot = slots[row];
-  const bool valid = (slot >= 0) && (slot < (int64_t)num_blocks * PAGE_SIZE);
-  if (!valid) return;
-  const int64_t safe_slot = slot;
-  const int block_id = (int)(safe_slot / PAGE_SIZE);
-  const int token = (int)(safe_slot % PAGE_SIZE);
-
-  char* cache_ptr = cache + (size_t)block_id * stride_cache_block
-      + (size_t)token * stride_cache_token;
-  const char* row_ptr = rows + (size_t)row * stride_rows_row;
-
+    int PAGE_SIZE, int WIDTH, int elem_bytes, int rows_per_block) {
   // The vectorized stride-1 path is only valid when both the row width and
   // the cache width are dense (element stride == 1). The server passes a
   // transposed ``canonical_qsa_rope_positions`` view whose last-dim stride is
@@ -85,14 +72,33 @@ __global__ void qsa_store_cache_rows_kernel(
   const int elems_per_vec = 16 / elem_bytes;
   const bool row_dense = (stride_rows_dim == elem_bytes);
   const bool cache_dense = (stride_cache_dim == elem_bytes);
-  const int vec_count = (row_dense && cache_dense) ? WIDTH / elems_per_vec : 0;
-  for (int v = threadIdx.x; v < vec_count; v += blockDim.x) {
-    const uint4 row_v = ld_u4(
-        reinterpret_cast<const uint4*>(row_ptr + (size_t)v * 16));
-    st_u4(reinterpret_cast<uint4*>(cache_ptr + (size_t)v * 16), row_v);
+  const bool vec_exact = (WIDTH % elems_per_vec) == 0;
+  if (row_dense && cache_dense && vec_exact && WIDTH >= elems_per_vec) {
+    // Dense path: vec_count threads cover one row, so a block spans
+    // blockDim.x / vec_count rows. One row per block left 240 of 256 threads
+    // idle and cost ~2.5x the Triton kernel.
+    const int vec_count = WIDTH / elems_per_vec;
+    const int row = blockIdx.x * rows_per_block + threadIdx.x / vec_count;
+    if (row >= num_rows) return;
+    const int64_t slot = slots[row];
+    if ((slot < 0) || (slot >= (int64_t)num_blocks * PAGE_SIZE)) return;
+    char* cache_ptr = cache + (size_t)(slot / PAGE_SIZE) * stride_cache_block
+        + (size_t)(slot % PAGE_SIZE) * stride_cache_token;
+    const char* row_ptr = rows + (size_t)row * stride_rows_row;
+    const int v = threadIdx.x % vec_count;
+    st_u4(reinterpret_cast<uint4*>(cache_ptr + (size_t)v * 16),
+          ld_u4(reinterpret_cast<const uint4*>(row_ptr + (size_t)v * 16)));
+    return;
   }
-  const int tail_start = vec_count * elems_per_vec;
-  for (int i = tail_start + threadIdx.x; i < WIDTH; i += blockDim.x) {
+
+  const int row = blockIdx.x;
+  if (row >= num_rows) return;
+  const int64_t slot = slots[row];
+  if ((slot < 0) || (slot >= (int64_t)num_blocks * PAGE_SIZE)) return;
+  char* cache_ptr = cache + (size_t)(slot / PAGE_SIZE) * stride_cache_block
+      + (size_t)(slot % PAGE_SIZE) * stride_cache_token;
+  const char* row_ptr = rows + (size_t)row * stride_rows_row;
+  for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {
     const char* src = row_ptr + (size_t)i * stride_rows_dim;
     char* dst = cache_ptr + (size_t)i * stride_cache_dim;
     if (elem_bytes == 2) {
@@ -133,14 +139,21 @@ void qsa_store_cache_rows(
   const int64_t stride_cache_token = cache.stride(1) * elem_bytes;
   const int64_t stride_cache_dim = cache.stride(3) * elem_bytes;
 
-  qsa_store_cache_rows_kernel<256><<<num_rows, 256, 0, stream>>>(
+  const int elems_per_vec = 16 / elem_bytes;
+  const bool dense = (stride_rows_dim == elem_bytes) &&
+      (stride_cache_dim == elem_bytes) && (width % elems_per_vec == 0) &&
+      (width >= elems_per_vec);
+  const int vec_count = dense ? (int)(width / elems_per_vec) : 1;
+  const int rows_per_block = dense ? (256 / vec_count) : 1;
+  const int grid = (num_rows + rows_per_block - 1) / rows_per_block;
+  qsa_store_cache_rows_kernel<256><<<grid, 256, 0, stream>>>(
       reinterpret_cast<const char*>(rows.const_data_ptr()),
       slots.const_data_ptr<int64_t>(),
       reinterpret_cast<char*>(cache.mutable_data_ptr()),
       num_rows, num_blocks,
       stride_rows_row, stride_rows_dim,
       stride_cache_block, stride_cache_token, stride_cache_dim,
-      (int)page_size, (int)width, elem_bytes);
+      (int)page_size, (int)width, elem_bytes, rows_per_block);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
