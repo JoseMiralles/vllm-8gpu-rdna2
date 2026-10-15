@@ -47,10 +47,24 @@ from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 DEV = "cuda"
 BT = FLA_CHUNK_SIZE
 K = V = 128
-WARMUP, ITERS = 5, 30
+WARMUP, ITERS, REPS = 5, 30, 5
 
 
-def timeit(fn):
+def warm_clocks(seconds=2.0):
+    """The GPU idles at 500 MHz and only boosts after ~10 ms of sustained load.
+    A short kernel (prep is 23-410 us) never ramps the clocks on its own, so the
+    first arm timed in a fresh process can read up to 4x high. Warm up first."""
+    import time
+
+    a = torch.randn(4096, 4096, device=DEV, dtype=torch.float16)
+    b = torch.randn(4096, 4096, device=DEV, dtype=torch.float16)
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        a @ b
+    torch.cuda.synchronize()
+
+
+def _one(fn):
     for _ in range(WARMUP):
         fn()
     torch.cuda.synchronize()
@@ -63,6 +77,11 @@ def timeit(fn):
     torch.cuda.synchronize()
     return start.elapsed_time(end) / ITERS * 1000.0
 
+
+def timeit(fn, reps=REPS):
+    """Minimum of `reps` batched measurements. Minimum, not mean: the only
+    variation is clock ramp and machine noise, both one-sided."""
+    return min(_one(fn) for _ in range(reps))
 
 def make_inputs(T, H=12, Hg=4, seed=7, n_seq=1):
     """Production-geometry varlen inputs; B=1 flattened, n_seq sequences."""
@@ -231,6 +250,7 @@ def kernel_arms(d):
 
 def main():
     out = {"device": torch.cuda.get_device_name(0)}
+    warm_clocks()
     # 1024/2048 are the served prefill chunks (--max-num-batched-tokens 2048);
     # 8k/16k are the long-context chunked-prefill sizes.
     for label, T, n_seq in (("prefill_1k", 1024, 1),
