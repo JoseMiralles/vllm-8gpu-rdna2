@@ -64,8 +64,14 @@ __device__ __forceinline__ __half2 gdn_load_f16x2(const __half* p) {
   return *reinterpret_cast<const __half2*>(p);
 }
 
+// waves_per_eu(4, 8) = 4 waves per SIMD32 = 2 workgroups per CU, which is the
+// most the 37120 B LDS footprint allows. Without it the compiler sizes the
+// register file for 1 WG/CU (193 VGPRs), and then only 12*N workgroups of a
+// multi-sequence batch can be resident: +16..17 % vs Triton at N=2 instead of
+// -19 %. The unroll factor below is what keeps the allocation inside that
+// budget (193 -> 113 VGPRs, no spill).
 __global__ void __launch_bounds__(GDN_THREADS)
-    __attribute__((amdgpu_waves_per_eu(2, 4)))
+    __attribute__((amdgpu_waves_per_eu(4, 8)))
     gdn_prefill_delta_h_packed_kernel(
         const __half* __restrict__ k,  // [B*T, Hg, K]
         const __half* __restrict__ u,  // [B*T, H, V]
@@ -213,7 +219,8 @@ __global__ void __launch_bounds__(GDN_THREADS)
 
     //    Pairing over t matches Triton's V_DOT2 lowering of tl.dot(b_k, b_v)
     //    with fp16 operands; each thread owns its 16 h elements, no shfl.
-#pragma unroll 8
+    // 2 WGs/CU caps the VGPR budget at 128/thread; unroll 8 needs 193.
+#pragma unroll 2
     for (int tp = 0; tp < GDN_BT / 2; ++tp) {
       const int t0 = 2 * tp;
       const bool valid0 = (t0 < t_len);
