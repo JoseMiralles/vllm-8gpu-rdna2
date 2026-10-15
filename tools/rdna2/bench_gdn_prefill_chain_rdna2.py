@@ -48,6 +48,7 @@ DEV = "cuda"
 BT = FLA_CHUNK_SIZE
 K = V = 128
 WARMUP, ITERS, REPS = 5, 30, 5
+WARM_S = 0.03  # sustained-load seconds before each timing
 
 
 def warm_clocks(seconds=2.0):
@@ -65,8 +66,17 @@ def warm_clocks(seconds=2.0):
 
 
 def _one(fn):
-    for _ in range(WARMUP):
-        fn()
+    # Warm up by DURATION, not by call count. A count-based warmup gives a 23 us
+    # kernel 30x less sustained load than a 700 us one, and the GPU only boosts
+    # after ~10 ms of load: prep's 1k row read 72 us that way instead of 24 us.
+    # The Triton arms are CPU-issue-bound, so they let the clocks drop again for
+    # whatever is timed next -- which is why the warmup has to be per-timing.
+    import time
+
+    t0 = time.time()
+    while time.time() - t0 < WARM_S:
+        for _ in range(WARMUP):
+            fn()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
