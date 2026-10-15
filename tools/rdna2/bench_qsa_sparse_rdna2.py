@@ -28,8 +28,11 @@ import test_qsa_rdna2 as T  # noqa: E402
 
 from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops  # noqa: E402
 
-# Production geometry: heads 4 / kv 1, head_dim 256, topk 2048, page_size 1024.
-HEADS, KV_HEADS, HEAD_DIM, TOPK, PAGE_SIZE = 4, 1, 256, 2048, 1024
+# Production geometry, TP4: main attention is num_attention_heads 24 / TP4 = 6 q
+# heads, num_key_value_heads 2 -> 1 kv head, head_dim 256 (config.json). Do not use
+# heads=4 here: that is the *indexer* MQA geometry (indexer_n_heads 4,
+# indexer_head_dim 128), a different op benched by bench_qsa_rdna2.py.
+HEADS, KV_HEADS, HEAD_DIM, TOPK, PAGE_SIZE = 6, 1, 256, 2048, 1024
 NUM_PAGES, NUM_REQUESTS = 64, 4
 
 
