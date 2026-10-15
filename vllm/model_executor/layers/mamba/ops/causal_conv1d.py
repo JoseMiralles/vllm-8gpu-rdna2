@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from vllm.platforms import current_platform
-from vllm.platforms.rdna import on_rdna2
+from vllm.platforms.rdna import on_rdna2, on_rdna2_hip
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
@@ -1299,9 +1299,16 @@ def causal_conv1d_update(
         # Same as the fwd dispatch: the HIP update uses the first width - 1
         # state columns, so a spec-sized cache with extra capacity is fine.
         and conv_state.size(2) >= width - 1
-        and hasattr(torch.ops, "_rocm_C")
-        and hasattr(torch.ops._rocm_C, "causal_conv1d_update_rdna2")
     ):
+        if not hasattr(torch.ops, "_rocm_C") or not hasattr(
+            torch.ops._rocm_C, "causal_conv1d_update_rdna2"
+        ):
+            # Loud on gfx10x: a silent fallback to Triton is a production
+            # regression (stale scratch pointers under FULL cudagraph replay).
+            raise RuntimeError(
+                "VLLM_CAUSAL_CONV1D_RDNA2_UPDATE is enabled on gfx10x but "
+                "causal_conv1d_update_rdna2 is not built; rebuild _rocm_C."
+            )
         # The kernel takes every stride (x/out/weight and the transposed
         # paged conv_state view), so nothing is copied and `out` is written
         # in place like the Triton path.
@@ -1314,6 +1321,62 @@ def causal_conv1d_update(
             else torch.empty(0, device=x.device, dtype=x.dtype),
             out,
             conv_state_indices,
+            activation in ("silu", "swish"),
+        )
+        if unsqueeze:
+            out = out.squeeze(-1)
+        return out.to(original_x_dtype)
+
+    # Same Triton kernel, varlen / speculative-decoding cases. MTP-2 sets
+    # num_accepted_tokens (and query_start_loc) on every spec-verify step, so
+    # without this the kernel above is skipped and Triton runs instead.
+    if (
+        os.environ.get("VLLM_CAUSAL_CONV1D_RDNA2_UPDATE", "1") == "1"
+        and on_rdna2_hip()
+        and (num_accepted_tokens is not None or query_start_loc is not None)
+        and block_idx_last_scheduled_token is None
+        and initial_state_idx is None
+        and null_block_id is not None
+        and conv_state_indices is not None
+        and conv_state_indices.dim() == 1
+        and x.dtype == torch.float16
+        and conv_state.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and (out.dtype == torch.float16 if out is not None else True)
+        and dim % 32 == 0
+        and 2 <= width <= 6
+        # The hip kernel reads the history window unmasked, exactly like
+        # Triton, so the cache must hold the whole effective state length.
+        and conv_state.size(2) >= state_len
+        # num_accepted_tokens / query_start_loc are read with a unit stride.
+        and (num_accepted_tokens is None or num_accepted_tokens.stride(0) == 1)
+        and (query_start_loc is None or query_start_loc.stride(0) == 1)
+    ):
+        if not hasattr(torch.ops, "_rocm_C") or not hasattr(
+            torch.ops._rocm_C, "causal_conv1d_update_spec_rdna2"
+        ):
+            raise RuntimeError(
+                "VLLM_CAUSAL_CONV1D_RDNA2_UPDATE is enabled on gfx10x but "
+                "causal_conv1d_update_spec_rdna2 is not built; rebuild _rocm_C."
+            )
+        torch.ops._rocm_C.causal_conv1d_update_spec_rdna2(
+            x,
+            conv_state,
+            weight,
+            bias
+            if bias is not None
+            else torch.empty(0, device=x.device, dtype=x.dtype),
+            out,
+            conv_state_indices,
+            num_accepted_tokens
+            if num_accepted_tokens is not None
+            else torch.empty(0, device=x.device, dtype=torch.int32),
+            query_start_loc
+            if query_start_loc is not None
+            else torch.empty(0, device=x.device, dtype=torch.int32),
+            int(state_len),
+            int(seqlen),
+            int(null_block_id),
             activation in ("silu", "swish"),
         )
         if unsqueeze:
