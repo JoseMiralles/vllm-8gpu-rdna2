@@ -102,6 +102,7 @@ actually sets.
 | `VLLM_RDNA_HC_PAD_M` | 64 | Pad HC row counts to the 64-step grid that has TunableOp rows. 0 disables (and loses ~60 ms per 512-token mixed step). |
 | `VLLM_RDNA_HC_PREFILL_HIP`, `VLLM_RDNA_PLE_CONV_HIP` | 0 | Opt-in HIP ports, not end-to-end verified. |
 | `VLLM_RDNA_QSA_HIP` | 0 | HIP QSA path. Fault-free but 4–10 % slower than Triton; keep off. |
+| `VLLM_RDNA_ALL_HIP` | 0 | Umbrella opt-in for the RDNA2 HIP kernel set: worker/sampler, top-k/top-p masking, QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE, vision pos-embed. With it unset gfx10x runs the Triton kernels it ran before the port; with it set the Triton audit shows zero launches and decode is ~99 vs ~89 tok/s (V620, TP4, MTP-2). Independent of the per-op flags above. |
 
 ### All-reduce (TP over PCIe)
 

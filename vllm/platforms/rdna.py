@@ -41,3 +41,16 @@ def on_rdna2() -> bool:
         else:
             _ON_RDNA2 = False
     return _ON_RDNA2
+
+
+def on_rdna2_hip() -> bool:
+    """True iff the opt-in RDNA2 HIP kernel set is enabled on this process.
+
+    The gfx1030 HIP ports are opt-in (``VLLM_RDNA_ALL_HIP=1``), matching the
+    other RDNA flags on this branch: with the flag unset gfx10x runs the Triton
+    kernels it ran before the port, so a deploy that does not opt in sees no
+    behaviour change.
+    """
+    from vllm.envs import VLLM_RDNA_ALL_HIP
+
+    return on_rdna2() and VLLM_RDNA_ALL_HIP
