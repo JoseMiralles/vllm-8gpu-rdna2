@@ -42,6 +42,9 @@ run() { # name input_len output_len prompts concurrency
 # 8k/16k shapes are the long-context chunked-prefill sizes the PR also quotes.
 run prefill_1k_c1 1024 1 64 1
 run prefill_1k_c8 1024 1 64 8
+# 2048 is the served prefill chunk (--max-num-batched-tokens 2048).
+run prefill_2k_c1 2048 1 64 1
+run prefill_2k_c8 2048 1 64 8
 run prefill_8k_c1 8192 1 16 1
 run prefill_8k_c8 8192 1 16 8
 run prefill_16k_c1 16384 1 8 1
