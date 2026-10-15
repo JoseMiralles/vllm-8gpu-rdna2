@@ -203,6 +203,32 @@ if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
 fi
 
+# CPU KV-cache tier: host preconditions (hwconfig/os/README.md). Warn loudly rather than fail: serving works
+# without them, but compaction can then stall a rank for 5-20 s (CHANGES.md #19b).
+if [[ " ${EXTRA_ARGS:-} " == *" --kv-offloading-size "* ]]; then
+  _cua=$(cat /proc/sys/vm/compact_unevictable_allowed 2>/dev/null || echo '?')
+  _ml=$(ulimit -l)
+  if [ "$_cua" != 0 ] || [ "$_ml" != unlimited ]; then
+    echo "WARNING: --kv-offloading-size without its host settings (see hwconfig/os/README.md):" >&2
+    [ "$_cua" != 0 ] && echo "  vm.compact_unevictable_allowed = $_cua (need 0: install hwconfig/os/etc/sysctl.d/90-vllm-offload.conf)" >&2
+    [ "$_ml" != unlimited ] && echo "  locked-memory limit $_ml KiB (need unlimited: hwconfig/os/ systemd drop-ins, or ulimit -l unlimited)" >&2
+    echo "  Expect occasional multi-second stalls on all ranks. Check everything with hwconfig/check-host.sh." >&2
+  fi
+fi
+
+# Triton pin (2026-10-09): upstream Triton dropped gfx1030 (triton-lang/triton #12042). Refuse to start on a
+# Triton other than the validated build in tools/rdna2/constraints-gfx1030.txt -- a newer one changes every custom
+# kernel's codegen. ALLOW_TRITON_DRIFT=1 overrides (for deliberate Triton experiments).
+_tpin=$(sed -n 's/^triton==//p' "$(dirname "$0")/constraints-gfx1030.txt" 2>/dev/null)
+_tnow=$(python3 -c 'import triton; print(triton.__version__)' 2>/dev/null || true)
+_tdist=$(python3 -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || true)
+if [ -n "$_tpin" ] && [ "$_tdist" != "$_tpin" ]; then
+  echo "ERROR: installed Triton is '${_tdist:-none}' (${_tnow:-?}); the validated gfx1030 build is $_tpin." >&2
+  echo "  Upstream Triton no longer supports gfx1030; reinstall the pinned wheel (tools/rdna2/build-torch-rocm714.sh)" >&2
+  echo "  or set ALLOW_TRITON_DRIFT=1 to run anyway." >&2
+  [ "${ALLOW_TRITON_DRIFT:-0}" = "1" ] || exit 1
+fi
+
 CMD=(python3 -m vllm.entrypoints.openai.api_server
   --model "$MODEL" --served-model-name qwen38-flash-next
   --dtype float16
@@ -223,4 +249,8 @@ if [ "${DRYRUN:-0}" = "1" ]; then
   printf '%q ' "${CMD[@]}"; echo
   exit 0
 fi
-exec "${CMD[@]}"
+# VLLM_SERVE_PREFIX: an optional wrapper for profiling runs, e.g.
+#   VLLM_SERVE_PREFIX="rocprofv3 --kernel-trace -f csv -d /path/out -P 420:4:1 --"
+# (rocprofv3 follows the spawned workers; -P collects one 4 s window 420 s after start). Unset = no wrapper.
+# shellcheck disable=SC2086
+exec ${VLLM_SERVE_PREFIX:-} "${CMD[@]}"

@@ -135,8 +135,27 @@ projections, router, shared expert, hyper-connection mixers, output head) ship i
 |---|---|---|
 | `VLLM_RDNA_FUSED_HC` | `1` | The hyper-connection mix (the model's four residual branches) runs as one fused kernel in decode instead of several small ones. |
 | `VLLM_RDNA_FUSED_SE` | `1` | The shared-expert MLP runs as one fused decode kernel. |
+| `VLLM_RDNA_MOE_V2` | `1` | The routed-expert decode kernels (batches up to 16) use the v2 pair: 16-byte weight loads, no shared-memory staging, only the experts held on this rank do work. `0` restores v1. |
+| `VLLM_RDNA_MOE_V3` | `1` | At decode batches of 1–2, the shared expert is computed inside the routed-expert kernel pair instead of as its own launches. Larger batches use v2 + the separate shared expert, which is as fast there. |
 
-Both cut the number of kernel launches per decode step, which was a major cost on this chip.
+All of these cut kernel launches or wasted work per decode step; launch overhead was a major cost on this chip.
+
+**int8 KV cache (`--kv-cache-dtype int8_per_token_head`).** The 12 full-attention (QSA) layers can keep their main
+K/V cache as int8 with one fp32 scale per token and head (absmax/127). This about doubles the KV-cache token
+capacity at unchanged decode and prefill speed: on 4 × V620 at `GPUUTIL=0.93`, 482k → 939k tokens. Needle retrieval
+at 32k/64k was unchanged (10/10), and greedy output stays within near-tie noise of the fp16 cache. The QSA indexer
+caches stay fp16; they are about 3 % of the per-token bytes. gfx1030 has no fp8 hardware, so use int8 rather than
+the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot.
+
+**Turn-boundary prefix hits (`--prefix-match-unit 16`).** Recommended for chat and agent use. Prefix-cache keys
+are then computed every 16 tokens instead of every 784-token block. Together with the scheduler tail stop above,
+each prompt saves its linear-attention state just before its generation prompt. A follow-up turn then
+recomputes only its new message plus a few template tokens: about 50–90 tokens. Before, it was up to one
+block, ≤ 783 tokens, or ≤ 1567 with int8 KV. On 4 × V620 that took follow-up TTFT from 0.3–1.5 s to 0.4–0.6 s,
+with no decode cost. The value must divide 784 and be a multiple of 4, the QSA indexer's compression ratio;
+it does not change the compile key. Trade-off: the hybrid model's shared block size is set so an attention page holds at least one Mamba state, so
+halving the bytes per token doubles the block (784 → 1568 tokens). Prefix-cache hits on follow-up turns are then 2×
+coarser, and up to ~1.5k tokens of a cached conversation are recomputed per turn instead of ~0.8k.
 
 ---
 
@@ -160,6 +179,27 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 | Variable | Default | Meaning |
 |---|---|---|
 | `VLLM_RDNA_MAMBA_RETENTION_STOPS` | `1` | End prefill steps exactly at the ends of the linear-attention state blocks (784 tokens) that the prefix cache retains. The saved state is only exact when a step ends on a block boundary. Without this, a follow-up turn on a long conversation could re-prefill tens of thousands of tokens (e.g. 31 s instead of seconds to first token). |
+| `VLLM_RDNA_MAMBA_TAIL_STOP` | `1` | With `--prefix-match-unit`, also end a prefill step at the prompt's last match boundary. The partial-tail state saved there is what lets a follow-up turn resume within a few tokens of the previous prompt's end, instead of at its last full 784-token block. Without `--prefix-match-unit` it does nothing. |
+| `VLLM_RDNA_PROMPT_TAIL_BACKOFF` | `4` | How many tokens before the prompt end the partial-tail state is placed. A chat follow-up re-renders the previous generation prompt (Qwen's empty think block is 4 tokens), so a state saved at the very end would sit past where the next prompt diverges. `0` restores upstream. |
+| `ALLOW_TRITON_DRIFT` | `0` | The serve script refuses to start unless the installed Triton is the pinned gfx1030 build in `tools/rdna2/constraints-gfx1030.txt`. Upstream Triton dropped RDNA2 targets on 2026-09-30, so a newer Triton changes how every custom kernel is compiled. Set `1` only for deliberate Triton experiments. |
+
+---
+
+## 7b. CPU KV-cache offload (§19)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--kv-offloading-size N` (vLLM argument, e.g. via `EXTRA_ARGS`) | off | Keep N GiB (total across all TP ranks) of pinned CPU RAM as a second KV-cache tier. Prefixes evicted from the GPU reload from RAM instead of being recomputed. |
+| `VLLM_USE_SIMPLE_KV_OFFLOAD` | `0` | **Set to `1` with this model.** Selects `SimpleCPUOffloadConnector`, which reuses vLLM's prefix-cache logic for every cache group. The default `OffloadingConnector` refuses to start on the QSA compressor ring (`tokens_per_block=4 not divisible by tokens_per_hash=784`). |
+| `VLLM_RDNA_OFFLOAD_TIMING` | `0` | Diagnostic: log each offload copy's duration, and every worker step slower than `VLLM_RDNA_OFFLOAD_TIMING_SLOW_MS` (default 500), with whether a copy overlapped it. |
+| `--kv-transfer-config '{"kv_connector_extra_config":{"lazy_offload":true}}'` | eager | Lazy mode: copy a block to RAM only when it is about to leave the GPU, so the two tiers hold different prefixes (resumable ≈ GPU + RAM instead of RAM alone). Works on this model only with the fork's fixes (§19b). |
+| `VLLM_RDNA_OFFLOAD_LAZY_TARGET` | computed (24 here) | Lazy mode: GPU blocks at the eviction end kept copied to RAM. 96 covers the allocation burst of reloading a ~48k-token prompt; larger reloads may lose some old tails. |
+| `VLLM_RDNA_OFFLOAD_LAZY_CURSOR` | `0` | `1` restores upstream's lazy walk (§19b fixes off). For comparison only. |
+| `VLLM_RDNA_OFFLOAD_LAZY_RESCUE` | `1` | Lazy mode: copy a cached block the GPU allocator evicts before it was offloaded (at the start of the step), and copy a block's prefix ancestors and Mamba states with it so RAM hits are contiguous (§19b items 6–7). |
+| `VLLM_RDNA_OFFLOAD_PIN_CHUNK_MB` | `128` | Register the RAM tier with the GPU driver in block-aligned chunks of about this size, so a page migration revalidates one chunk instead of the whole tier. `0` = one registration (upstream). |
+| `VLLM_RDNA_OFFLOAD_THP` | `1` | Back the RAM tier with transparent huge pages (`MADV_HUGEPAGE`), which memory compaction does not move. |
+| `VLLM_RDNA_OFFLOAD_MLOCK` | `1` | `mlock` the RAM tier and `mlockall(ONFAULT)` the GPU worker so compaction cannot migrate pages the GPU has mapped (each migration stalls all of that rank's GPU queues). Needs `RLIMIT_MEMLOCK` ≥ tier per rank + ~3 GB and `vm.compact_unevictable_allowed=0`; logs a warning and continues otherwise. |
+| `VLLM_RDNA_OFFLOAD_DEBUG` | `0` | Diagnostic: per cache group, lazy-walk counts every 30 s, and for a long request with no RAM hit, which group's blocks are missing. |
 
 ---
 
@@ -176,6 +216,7 @@ CPU worker process serves lookups from host memory, and the GPUs wait for its re
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | `600` (serve script: `3600`) | Seconds to wait for the worker to load the table and for all ranks to register. |
 | `PLE_OFFLOAD_DOORBELL` | `1` | Rank 0 posts each step's request into a shared memory page that the worker polls, instead of sending a ZMQ message. Saves ~170 µs per step. `0` restores ZMQ. |
 | `PLE_OFFLOAD_PREFAULT` | `1` | At startup, touch the table's pages in the background so the first requests don't stall on page faults. |
+| `PLE_OFFLOAD_ANON` | `0` | `1`: copy the quantized table into the worker's own (anonymous) memory at start and drop the file's page-cache copy. The kernel can then no longer evict table pages under memory pressure, which otherwise causes multi-second lookups and uneven TP ranks. **Required alongside `--kv-offloading-size`** (§19). Adds ~1–2 min to boot. Needs enough RAM for the whole table. |
 | `PLE_OFFLOAD_DEBUG_HOPS` | `0` | Test hook: timestamp each hop of the per-step round trip and log per-hop averages. |
 | `PLE_OFFLOAD_DEBUG_TRACE` | unset | Test hook: append one line per request (sequence, sizes, input and result hashes) to this file, so two runs can be compared. |
 | `PLE_OFFLOAD_DEBUG_DELAY_MS` | `0` | Test hook: add an artificial delay to every worker request. |

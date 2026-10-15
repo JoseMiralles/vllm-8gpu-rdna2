@@ -20,6 +20,36 @@ PLE-offload verification at build time). The entrypoint is the serve script; wei
 `/models`. TheRock publishes no gfx103X torch wheels, and the 7.14 line has moved off AMD's current
 channels — the published base image is the durable artifact. See containers/README.md.
 
+**2026-10-09 — MoE decode kernels v2/v3, decode batches up to 16.** The routed-expert decode pair was
+rewritten (v2: 16-byte weight loads, no shared-memory activation staging, EP-local slot compaction) and the
+small-batch kernels (int8/fp16 GEMV, the fused glue ops) now take batches up to 16, so a 9–16-request decode
+step no longer falls off to Triton/rocBLAS. At batch 1–2 the shared expert is folded into the routed pair (v3).
+Per MoE layer at batch 1: 88 → 71 µs (v2) → 65 µs (v3). In the serving process: single-stream decode +3.6 %
+(v2) then +4.1 % (v3); 16 concurrent streams 134 → 266 tok/s aggregate. Greedy output identical to the
+previous kernels. Switches: `VLLM_RDNA_MOE_V2`, `VLLM_RDNA_MOE_V3` (ENVIRONMENT.md).
+
+**2026-10-09 — int8 KV cache for the QSA layers, and the first decode small-op pass.** `--kv-cache-dtype
+int8_per_token_head` now works for Qwen3.8-Flash-Next. The QSA sparse-attention kernel reads int8 K/V and applies the
+per-token scales to the scores and the probabilities; writes go through vLLM's per-token-head quantizing cache kernel.
+This gives 1.95× the KV tokens with no measured speed or retrieval cost (ENVIRONMENT.md). Separately, a kernel trace of a
+whole decode step taken inside the serving process (about 1450 launches) led to two changes: the MoE output is no
+longer copied after every MoE layer, and the hyper-connection down projection uses a split-K GEMV. Together they give
++1.3 % single-stream decode.
+
+**2026-10-09 — follow-up turns resume at the previous prompt's end.** On this hybrid model a follow-up turn
+could only resume at the previous prompt's last full 784-token block, so it recomputed up to 783 tokens of
+history (1567 with int8 KV) before its own message. Upstream's fine-grained prefix hits (`--prefix-match-unit`)
+save a "partial tail" state inside a block, but the scheduler never ended a step there on this model. The fork
+adds that stop and places the tail 4 tokens before the prompt end, past the generation prompt that the next turn
+re-renders. With `--prefix-match-unit 16`, follow-ups recompute ~50–90 tokens. Resumed output matches a full
+recompute to within run-to-run noise.
+
+**2026-10-09 — Triton pinned.** Upstream Triton removed RDNA1/RDNA2 target support (triton-lang/triton #12042,
+2026-09-30): gfx1030 becomes an unknown ISA family. Every custom kernel here (QSA, W4A8 MoE, W8A8, GDN) is Triton,
+so `tools/rdna2/constraints-gfx1030.txt` pins the validated source builds: Triton 3.7.1 (ROCm/triton @ f0b55c0), and
+torch and torchvision with it. Use it as a pip constraint (the host venv's `pip.conf` does). The serve script refuses
+to start on any other Triton unless `ALLOW_TRITON_DRIFT=1`. Container images already build that exact ref.
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:
@@ -823,3 +853,133 @@ two of three runs (at 112 s and 205 s, ~170 W cap).
 Not yet shown: the same result at the higher power cap the host-mode drops happened at, and a longer or more
 decode-heavy load. If wide mode ever drops a card, the next variable is flow count (12 simultaneous flows against 4
 in RCCL's ring); a ring-ordered variant would test that.
+
+## 19. CPU KV-cache offload, `--kv-offloading-size` with `VLLM_USE_SIMPLE_KV_OFFLOAD=1` (2026-10-01)
+
+vLLM can keep a second KV-cache tier in pinned CPU RAM. Every computed block is also copied to RAM; when a prefix has
+been evicted from the GPU, a later request with that prefix reloads it from RAM instead of recomputing it. For several
+agents with long contexts sharing ~520k tokens of GPU cache, that replaces minute-long recomputes with ~1–2 s reloads.
+
+**Use the simple connector.** `--kv-offloading-size N` selects vLLM's default `OffloadingConnector`, which fails at
+startup on this model: `tokens_per_block=4 not divisible by tokens_per_hash=784`. The 4-token group is the QSA
+indexer's compressor ring (`CircularBufferSpec`, not prefix-cacheable), and that connector asserts on every group and
+has no case for ring buffers. `VLLM_USE_SIMPLE_KV_OFFLOAD=1` selects `SimpleCPUOffloadConnector` instead. It mirrors the
+GPU cache configuration on the CPU side and reuses vLLM's own prefix-cache coordinator, so the linear-attention state,
+the compressed sparse-attention keys and the ring are handled exactly as for GPU prefix caching. No code change needed.
+
+**Sizing.** `N` is GiB **in total across the TP ranks** (64 → 16 GiB per rank → 1,678 blocks of 784 tokens ≈ 1.32M
+tokens). The cache costs ~54 KB per token summed over 4 ranks. RAM holds a copy of what is on the GPU, so the extra
+resumable context is roughly (CPU tokens − GPU tokens): 32 GiB adds little over the GPU's ~520k; 64 GiB about 800k. The
+pinned memory comes out of the page cache, so check that anything else that must stay resident (the n-gram table) still
+is: with 64 GiB pinned on a 188 GB host the 52.5 GB fp8 table stayed 100 % resident (`fincore`).
+
+**Tests** (4× V620, 110 W, 2250 MHz ceiling; `bench/kv-offload/` in the research repo):
+
+- Reloads: 83k-token prompts evicted from the GPU reloaded with TTFT **1.1–1.2 s vs 64–68 s** fresh; 40k-token prompts
+  **1.6–2.7 s vs 37–38 s**. The tier served 100 % of the prompt tokens (external prefix-cache hits), over two eviction
+  cycles; least-recently-used prompts correctly fell out of RAM once the tier filled.
+- Correctness: **this engine is not run-to-run deterministic at long context**: two GPU prefix-cache hits of the same
+  40k prompt diverge at a near-tie (token ~10 / ~32), with logprob differences up to 0.27 before divergence. So the bar is
+  "indistinguishable from a GPU hit": reloads diverge from GPU runs no earlier than GPU runs diverge from each other (A 9–10
+  vs 10, B 32 vs 32), all outputs coherent, mean logprob of 64 tokens −0.18 to −0.26 for every path (CPU within 0.06 of
+  GPU). Corrupted KV would show up as garbage or a confidence collapse from the first token; none was seen.
+- Load: a 240 s, 4-worker mixed soak (503k prompt tokens) with offload active: 0 errors, no kernel events.
+- Decode unchanged: 63.0 t/s single stream (MTP 0, 262k context, fp8 n-gram table).
+
+**Incident and fix (same day): keep the n-gram table out of the page cache, `PLE_OFFLOAD_ANON=1`.** After four hours
+of production with the 64 GiB tier, a long agent turn hung: decode stopped, ranks 1–3 logged `PLE lookup … has taken
+>5 s`, and the one-shot all-reduce watchdog fired on ranks 0 and 2 (each waiting for the other, collectives apart).
+
+- The offload's copies were not involved: diagnostic timing (`VLLM_RDNA_OFFLOAD_TIMING=1`, logs every worker step over
+  `VLLM_RDNA_OFFLOAD_TIMING_SLOW_MS`) showed copies of 1–5 blocks taking milliseconds, and no slow step overlapped one. A
+  178k-token context with two reload cycles reproduced nothing (worst gap between tokens 0.05 s).
+- Cause: the fp8 n-gram table (52.5 GB) lives in the page cache, the kernel's first reclaim target. The tier pins 64 GiB
+  that cannot be reclaimed, so ordinary memory demand evicts table pages instead of free memory. A 40 GB pressure test
+  cut residency from 52.5 to 24 GB (worker major faults 95 → 370,902 in 150 s). Steps took 3–25 s, unevenly across TP
+  ranks (e.g. 4.3 / 4.5 / 5.0 s), past the watchdog's 2 s, and residency did not recover after the pressure ended.
+- Fix: `PLE_OFFLOAD_ANON=1` makes the worker copy every shard into its own anonymous memory at start and drop the
+  file's page-cache copy (same RAM, one copy). Without swap headroom anonymous memory cannot be reclaimed, so pressure
+  falls on everything else. Costs a sequential read of the table at worker start (~100–135 s cold from SATA). Opt-in:
+  a host with less RAM than the table should keep the mmap.
+- Validated with the 2 s watchdog, 64 GiB tier and `PLE_OFFLOAD_ANON=1`: 10 GB pressure during decode → 0 new worker
+  page faults, worst gap 0.02 s; 178k-token reload cycles (TTFT 1.1 s, decode 59.5 t/s, worst gap 0.09 s); exactness
+  vs GPU prefix hits passes (pooled noise floor: GPU-only runs diverge as early as token 9; one reload token-identical
+  over 64 tokens); 240 s four-worker soak clean; no wedges, no PLE stalls, no kernel events.
+- **Memory budget is now explicit:** pinned tier + table + workers. On the 188 GB host with 64 GiB pinned, ~15 GB stays
+  available. Size the tier so `MemAvailable` keeps a margin; anything that then runs the host out of memory hits the
+  OOM killer, where the largest process is the n-gram worker.
+
+### 19b. Lazy offload made to work on this model; offload tier made unmovable (2026-10-01, evening)
+
+**Lazy mode.** `--kv-transfer-config '{"kv_connector_extra_config":{"lazy_offload":true}}'` copies a block to RAM
+only when it is about to be evicted from the GPU, so GPU and RAM hold different prefixes and the resumable total is
+roughly GPU + RAM instead of RAM alone. Upstream's implementation served **0 %** from RAM on this model (capacity test:
+one 48k prompt, then 819k distinct tokens; `vllm:external_prefix_cache_hits_total` stayed 0). Eight problems, fixed in
+`vllm/v1/simple_kv_offload/manager.py` (`VLLM_RDNA_OFFLOAD_LAZY_CURSOR=1` restores the upstream walk):
+
+1. **Window size.** The number of GPU blocks kept "safe to evict" was computed per cache group as
+   `max_num_batched_tokens / block_size`. The QSA compressor ring (`CircularBufferSpec`, 4-token blocks) alone gave
+   512, for a window of 1,046 blocks — the whole free queue — so every block was copied as soon as it was freed (eager
+   behaviour). The ring holds one never-cached block per request; it now counts 1. Window 24, or
+   `VLLM_RDNA_OFFLOAD_LAZY_TARGET` (96 recommended: covers the allocation burst of reloading a ~48k prompt).
+2. **Cursor ran ahead.** The walk resumed from where it stopped and covered another window's worth every step, so
+   over a 24-step prefill it reached deep into the queue. Now measured from the head (next to be evicted) every step.
+3. **Copied blocks went back to the MRU end.** The copy pins the GPU block; releasing it appended it to the tail of
+   the LRU, so every copied block stayed on the GPU for another full cycle (tiers inclusive again). Now returned to
+   the head: it is next to be evicted, and safe in RAM.
+4. **In-flight copies not counted.** Pinned blocks leave the free queue, so each step walked past them; a reload
+   followed by decode copied ~390 blocks in seconds and the RAM tier's LRU dropped another prefix. The window now
+   subtracts blocks still being copied.
+5. **RAM recency not refreshed.** A block already in RAM (a reloaded prefix that was used again) was skipped as it
+   left the GPU, so its RAM copy kept its old position and was dropped first. Its RAM copy is now moved to most
+   recently used as the GPU copy leaves (once per 512 steps per block).
+
+6. **Blocks lost at eviction.** The window is a heuristic: a block can still reach the allocator uncopied (window
+   used up by in-flight copies, or one allocation larger than the window, e.g. admitting a long reload). One lost
+   block cuts every prefix through it (measured: a 178k prompt split GPU 0–15 / RAM 17+, block 16 nowhere → full
+   recompute). The allocator's eviction now hands such a block a RAM block, and the worker copies it at the very start
+   of the step (`Worker.execute_model`, before the model runner zeroes newly allocated blocks), on the compute stream;
+   the step's loads wait for it. The RAM copy becomes findable two steps later, when it has certainly completed even
+   with async scheduling. `VLLM_RDNA_OFFLOAD_LAZY_RESCUE=0` disables this and fix 7.
+7. **Half a prefix on each side.** vLLM frees a request's blocks tail first, so a prefix's head stays on the GPU
+   longest, but on this model a GPU hit also needs a Mamba state at or before its end (every 6,272 tokens), and a RAM
+   hit has to continue from where the GPU hit stops. Measured: GPU kept blocks 0–1 (no state → no GPU hit), RAM had 2+
+   (no block 0 → no RAM hit), a 178k reload recomputed everything. Now, when any attention block is copied, its prefix
+   ancestors still on the GPU are copied with it (each request's block chain is recorded when it finishes), together
+   with the Mamba state blocks of the same prefix positions. After that the 178k reload took **2.2 s instead of
+   ~155 s**.
+
+8. **RAM-tier eviction order.** A RAM hit needs an unbroken prefix, so the RAM tier's LRU must evict a prefix from its
+   tail and order prefixes by when they were last *used*, not when they were copied. Three measured failures and the
+   rules that fixed them: blocks at the Mamba retention positions reached RAM early (co-copied when the walk met a
+   Mamba block first) and were evicted first, so every 8th block of a prompt vanished; refreshing RAM copies on GPU
+   eviction kept bumping an old 178k prompt that left the GPU a few blocks per step; copies placed at the MRU end
+   ranked prompts used *before* a reloaded target as newer than it. Now: each request's block chain (parent keys)
+   and its last-use step are recorded; a newly copied block goes just before its parent (Mamba blocks before the
+   attention block of their position), a new prefix is inserted by its last-use step, blocks that can never be hit
+   (parent neither in RAM nor on the GPU) go to the eviction end, and a request using a prefix moves the whole
+   prefix, tail first, to the most-recent end.
+
+Capacity note: Mamba state snapshots occupy blocks too (~94 per 48k prompt, not 62), so a 48 GiB tier (1,258 blocks)
+holds ~13 such prompts (~630k tokens) and the GPU ~7.
+
+**Multi-second stalls: KFD queue eviction on page migration.** Under load all ranks sometimes took 5–20 s for one
+step (`PLE lookup … has taken >5 s` on the ranks waiting for rank 0). `/sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/
+evicted_ms` showed ~120 s of accumulated queue eviction per worker in one run. The tier is registered with
+`cudaHostRegister`, which on ROCm makes it a KFD *userptr*: the pages stay movable. When the kernel migrates any page
+of it (memory compaction), KFD stops every queue of the process and re-faults and re-maps the **whole** registration
+before resuming — 12 GB per rank took 5–20 s. Eviction jumps line up with `pgmigrate_success` jumps.
+(`hipHostMalloc` does not avoid it: ROCr backs it with shared memory registered the same way.) Mitigations, all in
+`cuda_mem_ops.py`/`worker.py`:
+
+- Register in block-aligned ~128 MB chunks (`VLLM_RDNA_OFFLOAD_PIN_CHUNK_MB`, 0 = one piece): an invalidation
+  revalidates one chunk. Copies are per block, so none crosses a chunk.
+- Back the tier with transparent huge pages (`VLLM_RDNA_OFFLOAD_THP`, default on): compaction skips 2 MB pages.
+  Coverage depends on fragmentation at allocation time (35–60 % measured).
+- `mlock` the tier and `mlockall(ONFAULT)` the worker (`VLLM_RDNA_OFFLOAD_MLOCK`, default on): with
+  `vm.compact_unevictable_allowed=0` compaction skips locked pages entirely, including ROCr's own ~2.5 GB of host
+  allocations per worker, which are movable userptrs too.
+- **Host settings required** (otherwise the code only logs a warning): `RLIMIT_MEMLOCK` ≥ tier per rank + ~3 GB
+  (unlimited is simplest) for the vLLM process, `vm.compact_unevictable_allowed=0`, and preferably
+  `vm.compaction_proactiveness=0` (background compaction was the largest source of migrations). See
+  `hwconfig/README.md`.
