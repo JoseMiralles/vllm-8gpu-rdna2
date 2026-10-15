@@ -680,7 +680,14 @@ std::tuple<at::Tensor, at::Tensor> qsa_mqa_paged_rdna2(
 // ---------------------------------------------------------------------------
 namespace {
 
-template <typename TPos, typename TSeq>
+// Columns per thread. The op is dominated by the per-row preamble and by the
+// workgroup dispatch rate (the production grid is rows * 9 workgroups of 256
+// threads), so a thread covering four strided columns cuts both by 4. Measured
+// on gfx1030 at ratio 4 / topk 512: 4 is the knee (2 leaves ~6 us on the table
+// at rows=2048, 8 costs ~0.3 us at rows<=24).
+constexpr int kColsPerThread = 4;
+
+template <typename TPos, typename TSeq, int CRE>
 __global__ void qsa_expand_indices_kernel(
     const int32_t* __restrict__ block_indices,
     const TPos* __restrict__ query_positions,
@@ -688,10 +695,17 @@ __global__ void qsa_expand_indices_kernel(
     const int32_t* __restrict__ token_to_req, int32_t* __restrict__ out,
     int64_t stride_blocks_row, int64_t stride_blocks_column,
     int64_t stride_out_row, int64_t stride_out_column, int rows,
-    int num_requests, int block_topk, int compress_ratio, int output_width) {
+    int num_requests, int block_topk, int cr_rt, int output_width) {
+  // compress_ratio as a compile-time constant turns the four runtime integer
+  // divisions in the per-thread preamble (two of them int64) into shifts, which
+  // is what Triton's COMPRESS_RATIO constexpr already gives its kernel. The
+  // generic runtime path is kept for ratios outside the instantiated set.
+  constexpr int CR = CRE;
+  const int compress_ratio = (CR > 0) ? CR : cr_rt;
   const int row = blockIdx.x;
-  const int col = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
-  if ((row >= rows) || (col >= output_width)) return;
+  if (row >= rows) return;
+  const int col_base =
+      (int)blockIdx.y * (blockDim.x * kColsPerThread) + (int)threadIdx.x;
 
   const int64_t query_position = (int64_t)query_positions[row];
   const int32_t request = token_to_req[row];
@@ -707,28 +721,38 @@ __global__ void qsa_expand_indices_kernel(
   const int tail_start = (int)((query_position + 1) / compress_ratio) * compress_ratio;
   const int tail_count = (int)((query_position + 1) - tail_start);
 
-  int token = -1;
-  if (col < expanded_count) {
-    // Expanded block entry. Guarded exactly like Triton's masked load, so a
-    // zero block_topk never reads (its expanded_count is 0 and nothing takes
-    // this branch).
-    const int block_rank = col / compress_ratio;
-    const int offset = col - block_rank * compress_ratio;
-    const int safe_rank = min(block_rank, block_topk - 1);
-    const int64_t block =
-        block_indices[(int64_t)row * stride_blocks_row
-                      + (int64_t)safe_rank * stride_blocks_column];
-    token = (int)(block * compress_ratio + offset);
-  } else {
-    // Compaction of the causal tail of the open group.
-    const int tail_offset = col - expanded_count;
-    if ((tail_offset < tail_count) && (tail_offset < compress_ratio - 1)) {
-      token = tail_start + tail_offset;
+  // Each thread owns kColsPerThread columns strided by blockDim.x: the stores
+  // stay fully coalesced, while the per-row preamble above and the workgroup
+  // count are both kColsPerThread times smaller. The strided form measured far
+  // better than giving one thread a whole contiguous rank (that layout writes
+  // 4 bytes every 16 within a warp and loses store coalescing).
+#pragma unroll
+  for (int o = 0; o < kColsPerThread; o++) {
+    const int col = col_base + o * (int)blockDim.x;
+    if (col >= output_width) continue;
+    int token = -1;
+    if (col < expanded_count) {
+      // Expanded block entry. Guarded exactly like Triton's masked load, so a
+      // zero block_topk never reads (its expanded_count is 0 and nothing takes
+      // this branch).
+      const int block_rank = col / compress_ratio;
+      const int offset = col - block_rank * compress_ratio;
+      const int safe_rank = min(block_rank, block_topk - 1);
+      const int64_t block =
+          block_indices[(int64_t)row * stride_blocks_row
+                        + (int64_t)safe_rank * stride_blocks_column];
+      token = (int)(block * compress_ratio + offset);
+    } else {
+      // Compaction of the causal tail of the open group.
+      const int tail_offset = col - expanded_count;
+      if ((tail_offset < tail_count) && (tail_offset < compress_ratio - 1)) {
+        token = tail_start + tail_offset;
+      }
     }
+    const bool valid = (token >= 0) && ((int64_t)token < sequence_length);
+    out[(int64_t)row * stride_out_row + (int64_t)col * stride_out_column] =
+        valid ? token : -1;
   }
-  const bool valid = (token >= 0) && ((int64_t)token < sequence_length);
-  out[(int64_t)row * stride_out_row + (int64_t)col * stride_out_column] =
-      valid ? token : -1;
 }
 
 }  // namespace
@@ -793,12 +817,14 @@ torch::Tensor qsa_expand_indices_rdna2(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int64_t num_requests = sequence_lengths.numel();
   dim3 grid((unsigned)rows,
-            (unsigned)((output_width + kColumnBlock - 1) / kColumnBlock));
+            (unsigned)((output_width + kColumnBlock * kColsPerThread - 1)
+                       / (kColumnBlock * kColsPerThread)));
 
-  auto launch = [&](auto pos_tag, auto seq_tag) {
+  auto launch_one = [&](auto pos_tag, auto seq_tag, auto cr_tag) {
     using TPos = decltype(pos_tag);
     using TSeq = decltype(seq_tag);
-    qsa_expand_indices_kernel<TPos, TSeq><<<grid, kColumnBlock, 0, stream>>>(
+    constexpr int CRE = decltype(cr_tag)::value;
+    qsa_expand_indices_kernel<TPos, TSeq, CRE><<<grid, kColumnBlock, 0, stream>>>(
         block_indices.const_data_ptr<int32_t>(),
         reinterpret_cast<const TPos*>(query_positions.const_data_ptr()),
         reinterpret_cast<const TSeq*>(sequence_lengths.const_data_ptr()),
@@ -807,6 +833,16 @@ torch::Tensor qsa_expand_indices_rdna2(
         block_indices.stride(1), result.stride(0), result.stride(1), (int)rows,
         (int)num_requests, (int)block_topk, (int)compress_ratio,
         (int)output_width);
+  };
+  auto launch = [&](auto pos_tag, auto seq_tag) {
+    switch ((int)compress_ratio) {
+      case 1: launch_one(pos_tag, seq_tag, std::integral_constant<int, 1>{}); break;
+      case 2: launch_one(pos_tag, seq_tag, std::integral_constant<int, 2>{}); break;
+      case 4: launch_one(pos_tag, seq_tag, std::integral_constant<int, 4>{}); break;
+      case 8: launch_one(pos_tag, seq_tag, std::integral_constant<int, 8>{}); break;
+      case 16: launch_one(pos_tag, seq_tag, std::integral_constant<int, 16>{}); break;
+      default: launch_one(pos_tag, seq_tag, std::integral_constant<int, 0>{}); break;
+    }
   };
   if (pos_dtype == at::kLong && seq_dtype == at::kInt) {
     launch((int64_t)0, (int32_t)0);
