@@ -42,7 +42,7 @@ __global__ void mrope_forward_rdna2_kernel(
   const int t_end = sec_t;
   const int h_end = t_end + sec_h;
 
-  for (int i = 0; i < half_rd; ++i) {
+  for (int i = threadIdx.x; i < half_rd; i += blockDim.x) {
     bool h_mask = false, w_mask = false;
     if (is_interleaved) {
       h_mask = (i % 3 == 1) && (i <= 3 * sec_h);
@@ -125,9 +125,21 @@ void mrope_forward_rdna2(torch::Tensor q, torch::Tensor k, torch::Tensor cos,
   const at::cuda::OptionalCUDAGuard guard(device_of(q));
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 grid(num_tokens_i);
+  // One block per token; the block strides over the rotary index. One thread
+  // per token left the decode step (3 tokens) running 3 live threads on a
+  // 72-CU part: 495 us per call against 10 us here, same tensors, back-to-back.
+  // VLLM_RDNA_MROPE_BLOCK overrides the block size (1 = the old launch shape).
+  const char* block_env = std::getenv("VLLM_RDNA_MROPE_BLOCK");
+  int nthreads = ((half_rd + 31) / 32) * 32;
+  if (nthreads > 128) nthreads = 128;
+  if (nthreads < 1) nthreads = 1;
+  if (block_env != nullptr) {
+    const int b = std::atoi(block_env);
+    if (b > 0) nthreads = b;
+  }
   using vllm::rdna2_mrope::mrope_forward_rdna2_kernel;
   // hipify needs the kernel name on the same line as <<<.
-  mrope_forward_rdna2_kernel<<<grid, 1, 0, stream.stream()>>>(
+  mrope_forward_rdna2_kernel<<<grid, nthreads, 0, stream.stream()>>>(
       reinterpret_cast<__half*>(q.data_ptr()),
       reinterpret_cast<__half*>(k.data_ptr()),
       reinterpret_cast<const __half*>(cos.data_ptr()),

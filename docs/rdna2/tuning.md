@@ -103,6 +103,7 @@ actually sets.
 | `VLLM_RDNA_HC_PREFILL_HIP`, `VLLM_RDNA_PLE_CONV_HIP` | 0 | Opt-in HIP ports, not end-to-end verified. |
 | `VLLM_RDNA_QSA_HIP` | 0 | HIP QSA path. Fault-free but 4–10 % slower than Triton; keep off. |
 | `VLLM_RDNA_ALL_HIP` | 0 | Umbrella opt-in for the RDNA2 HIP kernel set: worker/sampler, top-k/top-p masking, QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE, vision pos-embed. With it unset gfx10x runs the Triton kernels it ran before the port; with it set the Triton audit shows zero launches and decode is ~99 vs ~89 tok/s (V620, TP4, MTP-2). Independent of the per-op flags above. |
+| `VLLM_RDNA_MROPE_BLOCK` | auto | HIP M-RoPE block size. `auto` = one block per token, striding the rotary index across the block; `1` restores the one-thread-per-token launch, which at decode (3 tokens) runs 3 threads and makes the kernel ~50x slower (494 vs 10 us, gfx1030). |
 
 ### All-reduce (TP over PCIe)
 
