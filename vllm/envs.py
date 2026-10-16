@@ -339,11 +339,11 @@ if TYPE_CHECKING:
     VLLM_RDNA_HC_PREFILL_HIP: bool = True
     VLLM_RDNA_QSA_HIP: bool = True
     VLLM_RDNA_PLE_CONV_HIP: bool = False
-    # Umbrella opt-in for the whole RDNA2 HIP kernel set (worker/sampler,
-    # top-k/top-p masking, QSA metadata, MTP conv1d + GDN spec-verify,
-    # unquantized MoE, vision pos-embed). Default off: with it unset gfx10x
-    # runs the Triton kernels exactly as before the port.
-    VLLM_RDNA_ALL_HIP: bool = False
+    # Umbrella for the whole RDNA2 HIP kernel set (worker/sampler, top-k/top-p
+    # masking, QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE,
+    # vision pos-embed). Default on: gfx10x runs the HIP set; set 0 to fall
+    # back to the Triton kernels as before the port.
+    VLLM_RDNA_ALL_HIP: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2200,7 +2200,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "1") == "1",
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
-    "VLLM_RDNA_ALL_HIP": lambda: os.getenv("VLLM_RDNA_ALL_HIP", "0") == "1",
+    "VLLM_RDNA_ALL_HIP": lambda: os.getenv("VLLM_RDNA_ALL_HIP", "1") == "1",
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.

@@ -14,7 +14,7 @@ whenever a kernel moves between stages.
 > and `VLLM_GDN_HIP_PREFILL` now default to `"1"`. The decisive evidence is an
 > order-controlled gates-only A/B/A (+1-7 % prefill) plus a 150-question GSM8K
 > parity run; see the closing "S6 — defaults flipped" section.
-> `VLLM_RDNA_ALL_HIP` and `VLLM_RDNA_PLE_CONV_HIP` stay `"0"`.
+> `VLLM_RDNA_ALL_HIP` is on too; only `VLLM_RDNA_PLE_CONV_HIP` stays `"0"`.
 
 ## Status legend
 
@@ -1252,7 +1252,7 @@ QSA only.
    hits; every number here is concurrency-1 and zero-cache.
 5. **[S6 default-on] DONE 2026-10-16.** The five per-op gates are now on by
    default (QSA/HC/GDN code defaults flipped to `"1"`; the two conv1d gates
-   already were), and `VLLM_RDNA_ALL_HIP` / `VLLM_RDNA_PLE_CONV_HIP` stay `"0"`.
+   already were) plus `VLLM_RDNA_ALL_HIP`; only `VLLM_RDNA_PLE_CONV_HIP` stays `"0"`.
    The "~1.2 % prefill cost" above was an artefact of the pre-rewrite kernels —
    the gates-only A/B/A is +1-7 % prefill. See the closing
    "S6 — defaults flipped" section.
@@ -1641,10 +1641,13 @@ confirming a 512 cap.
 
 ## S6 — defaults flipped (2026-10-16)
 
-`VLLM_RDNA_QSA_HIP`, `VLLM_RDNA_HC_PREFILL_HIP` and `VLLM_GDN_HIP_PREFILL` are
-now `"1"` by default. `VLLM_RDNA_ALL_HIP` stays `"0"` (29 call sites, cross-model
-blast radius, and its prefill win is just these gates' win);
-`VLLM_RDNA_PLE_CONV_HIP` was not in the measured set and stays `"0"`.
+`VLLM_RDNA_QSA_HIP`, `VLLM_RDNA_HC_PREFILL_HIP`, `VLLM_GDN_HIP_PREFILL` and the
+`VLLM_RDNA_ALL_HIP` umbrella are now `"1"` by default; only
+`VLLM_RDNA_PLE_CONV_HIP` stays `"0"` (not in the measured set). The umbrella
+gates 29 call sites beyond the five prefill gates (decode sampler, top-k/top-p,
+QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE, vision pos-embed);
+its prefill win is the gates' win, and its decode-side ports are exercised by the
+`VLLM_RDNA_ALL_HIP=1` test suite.
 
 ### Decisive measurement — order-controlled gates-only A/B/A
 `off -> on -> off`, three fresh servers, umbrella `0` in all three arms, prefix

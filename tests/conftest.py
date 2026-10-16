@@ -19,7 +19,7 @@ import math
 import mimetypes
 import os
 
-# Opt the whole suite into the gfx10x HIP kernel set. The ports are opt-in
+# Force the gfx10x HIP kernel set for the whole suite. It is on by default
 # (VLLM_RDNA_ALL_HIP, see docs/rdna2/tuning.md); the RDNA2 parity and dispatch
 # tests assert the HIP path is taken, and the modules cache the gate at import
 # time, so this has to be set before any vllm module is imported. Tests that
