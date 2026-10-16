@@ -86,7 +86,7 @@ def table(scenarios, arms, concs):
                 )
             print(line)
         if len(arms) == 2:
-            a, b = (arms[l] for l in arms)
+            a, b = arms.values()
             print(f"{'delta':>4} (B-A)/A, negative = B better")
             for c in concs:
                 ra, rb = a.get((sc, c)), b.get((sc, c))

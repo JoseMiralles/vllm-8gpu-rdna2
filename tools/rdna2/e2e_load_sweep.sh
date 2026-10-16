@@ -55,11 +55,16 @@ sweep() { # name in out concs...
 }
 
 echo "=== sweep $label ==="
-sweep prefill_1k 1024 1 1 2 4 8 16 32
-sweep prefill_2k 2048 1 1 2 4 8 16
-sweep prefill_8k 8192 1 1 2 4 8
-sweep prefill_16k 16384 1 1 2 4 8
-sweep decode 128 256 1 2 4 8 16 32
-sweep mixed_2k 2048 128 1 2 4 8 16
+# SWEEP_SCENARIOS limits the run to a subset (space-separated), for re-measuring a
+# single scenario without restarting the whole 30-case sweep.
+scen=${SWEEP_SCENARIOS:-all}
+want() { [ "$scen" = all ] || [[ " $scen " == *" $1 "* ]]; }
+
+want prefill_1k && sweep prefill_1k 1024 1 1 2 4 8 16 32
+want prefill_2k && sweep prefill_2k 2048 1 1 2 4 8 16
+want prefill_8k && sweep prefill_8k 8192 1 1 2 4 8
+want prefill_16k && sweep prefill_16k 16384 1 1 2 4 8
+want decode && sweep decode 128 256 1 2 4 8 16 32
+want mixed_2k && sweep mixed_2k 2048 128 1 2 4 8 16
 
 .venv/bin/python tools/rdna2/e2e_load_report.py "$label"

@@ -9,9 +9,24 @@
 # Prefill chunks are capped at --max-num-batched-tokens 2048, so T=2048 is the
 # served shape; 8k/16k are the long-context chunked-prefill sizes.
 #
-# NOTE: the gates only cover the prefill ports (QSA metadata + sparse, GDN,
-# hyper-connection, causal-conv1d). Decode-side HIP kernels are unconditional, so
-# both arms have them and the difference isolates the prefill paths.
+# NOTE: the arm difference is NOT prefill-only. `VLLM_RDNA_ALL_HIP` is the umbrella
+# (`on_rdna2_hip()` = `on_rdna2() and VLLM_RDNA_ALL_HIP`) and gates 29 call sites, including
+# the decode hot path: `v1/sample/ops/topk_topp_sampler.py`, all of `v1/worker/gpu/sample/*`,
+# `spec_decode/{speculator,rejection_sampler}`, `input_batch`/`block_table`, and the QSA
+# metadata builder (which runs twice per decode step). So this A/B is "whole HIP port vs
+# Triton/FLA", i.e. the `VLLM_RDNA_ALL_HIP` default-flip decision, not a prefill isolation.
+# A prefill-isolated arm is `VLLM_RDNA_ALL_HIP=1` plus the five individual gates set to 0.
+#
+# Env knobs:
+#   SWEEP_SCENARIOS="prefill_1k prefill_2k"  limit the sweep to a subset
+#   SWEEP_TAG=_rep                           suffix the results dir only
+#   EXTRA_ARGS_APPEND=--no-enable-prefix-caching
+#       appended to the server's EXTRA_ARGS by serve_v620_stable.sh, AFTER the launcher's
+#       --enable-prefix-caching, so last-wins disables it. REQUIRED for a clean prefill
+#       measurement: `--dataset-name random --seed 0` generates request i as
+#       `allowed[(offset_i + i + arange(len))]`, so prompts collide across bench cases and
+#       prefix caching serves whole prompts from cache (a 16k hit costs ~1.3 s regardless of
+#       length). Without this, per-request latency inside one case spreads 15-57x at 8k/16k.
 set -euo pipefail
 repo=/home/wsantos/work/vllm-rdna
 cd "$repo"
@@ -45,6 +60,9 @@ run_arm() { # label  env...
   local label=$1
   shift
   echo "=== arm $label ==="
+  # SWEEP_TAG suffixes only the results directory, so re-measuring one scenario
+  # does not overwrite the full-sweep JSONs.
+  local tag="$label${SWEEP_TAG:-}"
   stop_server
   env "$@" bash tools/rdna2/serve_v620_stable.sh \
     >".pi/e2e_$label.server.log" 2>&1 &
@@ -53,7 +71,7 @@ run_arm() { # label  env...
     stop_server || true
     return 1
   fi
-  bash tools/rdna2/bench_serve_gates_ab.sh "$label" || true
+  bash tools/rdna2/e2e_load_sweep.sh "$tag" || true
   stop_server
 }
 
@@ -77,12 +95,12 @@ HIP_ENV=(
 )
 
 case "$arms" in
-  triton) run_arm triton "${TRITON_ENV[@]}" ;;
-  hip) run_arm hip "${HIP_ENV[@]}" ;;
+  triton) run_arm triton "${TRITON_ENV[@]}" || echo "arm triton FAILED" ;;
+  hip) run_arm hip "${HIP_ENV[@]}" || echo "arm hip FAILED" ;;
   both)
-    run_arm triton "${TRITON_ENV[@]}"
-    run_arm hip "${HIP_ENV[@]}"
+    run_arm triton "${TRITON_ENV[@]}" || echo "arm triton FAILED"
+    run_arm hip "${HIP_ENV[@]}" || echo "arm hip FAILED"
     ;;
   *) echo "usage: $0 [both|triton|hip]"; exit 2 ;;
 esac
-echo "=== logs in $repo/.pi/serve_ab_{triton,hip}/ ==="
+echo "=== logs in $repo/.pi/sweep_{triton,hip}/ ==="
