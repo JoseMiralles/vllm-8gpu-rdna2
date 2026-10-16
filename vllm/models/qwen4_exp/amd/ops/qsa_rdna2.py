@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HIP-side QSA (Qwen Sparse Attention) decode kernels for Qwen4Exp on gfx1030.
 
-Opt-in replacement for the QSA decode Triton kernels in
+HIP replacement for the QSA decode Triton kernels in
 ``vllm/models/qwen4_exp/amd/ops/qsa.py``:
 
 - ``qsa_store_cache_rows_rdna2`` mirrors ``_store_qsa_rows_kernel``.
@@ -15,8 +15,8 @@ The sparse splitk attention (``_qsa_sparse_paged_gqa_splitk_kernel`` and
 only fires at prefill (M >> 8) and the prefill cudagraph story on
 gfx1030 is still being worked through.
 
-Gated by ``VLLM_RDNA_QSA_HIP=1`` and ``on_gfx10x()``. Default off
-(Triton path stays the source of truth until verified).
+Gated by ``VLLM_RDNA_QSA_HIP=1`` and ``on_gfx10x()``. Default on since
+2026-10-16 (faster than Triton at every served shape).
 """
 
 import os as _os

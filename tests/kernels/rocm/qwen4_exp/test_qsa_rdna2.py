@@ -69,10 +69,10 @@ def triton_gate(monkeypatch):
 def test_qsa_op_registered(op):
     assert _op(op), f"{op} not registered (rebuild _rocm_C.abi3.so)"
 
-def test_qsa_env_gate_defaults_off():
+def test_qsa_env_gate_defaults_on():
     from vllm.envs import VLLM_RDNA_QSA_HIP
 
-    assert VLLM_RDNA_QSA_HIP is False, "HIP QSA path must stay opt-in"
+    assert VLLM_RDNA_QSA_HIP is True, "HIP QSA path is on by default (S6)"
 
 def test_qsa_dispatcher_env_gate(monkeypatch):
     monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)

@@ -276,10 +276,12 @@ def _gdn_prefill_chain_rdna2(
 
 
 def _gdn_prefill_dispatch_available() -> bool:
-    """True iff the RDNA2 GDN prefill HIP chain is explicitly opted in."""
-    # Opt-in: the HIP chain measured 8.7% slower than Triton/FLA on a 16k
-    # prefill (77.7s vs 70.9s) and 6.4% lower PP at TP=4.
-    if os.environ.get("VLLM_GDN_HIP_PREFILL", "0") != "1":
+    """True iff the RDNA2 GDN prefill HIP chain is enabled."""
+    # Default on: after the 2026-10-15 kernel rewrites the chain is 18.3%
+    # faster than Triton/FLA on a 16k prefill. A TP=4 PP/logit-fidelity run
+    # is still owed; GSM8K is 150/150 identical, and the fp16-ulp parity
+    # tests against an fp64 oracle favour HIP for delta_h.
+    if os.environ.get("VLLM_GDN_HIP_PREFILL", "1") != "1":
         return False
     return on_rdna2() and hasattr(torch.ops._rocm_C, "gdn_prefill_prep_rdna2")
 

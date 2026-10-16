@@ -4,7 +4,7 @@
 
 Used by Qwen3.8-Flash-Next.
 
-Opt-in replacement for the Triton kernels in
+HIP replacement for the Triton kernels in
 ``vllm/models/qwen4_exp/amd/ops/hc.py``. Each function here mirrors the
 Triton ``_grouped_gemma_rmsnorm_kernel`` / ``_hc_silu_kernel`` /
 ``_hc_gate_mix_kernel`` / ``_hc_combine_kernel`` /
@@ -12,10 +12,10 @@ Triton ``_grouped_gemma_rmsnorm_kernel`` / ``_hc_silu_kernel`` /
 binding via ``csrc/rocm/torch_bindings.cpp`` under
 ``hc_*_rdna2``.
 
-Gated by ``VLLM_RDNA_HC_PREFILL_HIP=1`` and ``on_gfx10x()``. Default off:
-correct, but its kernels run each row on one thread (the whole block repeats
-the same work), so the silu + gate mix is ~8x slower than Triton. The prefill
-HC mix itself is fused in ``csrc/rocm/hc_prefill_rdna2.cu`` (``rdna_hc_mix``).
+Gated by ``VLLM_RDNA_HC_PREFILL_HIP=1`` and ``on_gfx10x()``. Default on since
+2026-10-16: the 2026-10-14 whole-block rewrite removed the ~8x deficit the
+original one-thread-per-row kernels had. The prefill HC mix itself is fused in
+``csrc/rocm/hc_prefill_rdna2.cu`` (``rdna_hc_mix``).
 
 The dispatcher in ``ops/hc.py`` imports these functions and routes to
 them when the env-var gate is set; otherwise it falls through to the

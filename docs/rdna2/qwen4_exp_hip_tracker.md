@@ -10,6 +10,12 @@ path overview lives at
 [`qwen4_exp_hip_path.md`](qwen4_exp_hip_path.md). Update this tracker
 whenever a kernel moves between stages.
 
+> **S6 landed 2026-10-16.** `VLLM_RDNA_QSA_HIP`, `VLLM_RDNA_HC_PREFILL_HIP`
+> and `VLLM_GDN_HIP_PREFILL` now default to `"1"`. The decisive evidence is an
+> order-controlled gates-only A/B/A (+1-7 % prefill) plus a 150-question GSM8K
+> parity run; see the closing "S6 — defaults flipped" section.
+> `VLLM_RDNA_ALL_HIP` and `VLLM_RDNA_PLE_CONV_HIP` stay `"0"`.
+
 ## Status legend
 
 - **[ ]** open
@@ -214,7 +220,7 @@ chunk size instead of +6.5 %.
 **Net position of the opt-in gates: prefill -0.7 to -1.4 %, decode
 indistinguishable from noise.** The scratch-buffer fix moved 16k from -1.9 %
 to -0.7 %, i.e. roughly two thirds of the gap was host-side per-call cost, but
-the gates are still not a win and **S6 must stay off**.
+the gates are still not a win and **S6 must stay off** *(superseded 2026-10-16 — the kernels were rewritten 2026-10-15 and the gate now wins; see the closing "S6 — defaults flipped" section)*.
 
 What is left is smaller than the run-to-run spread of a single arm (±0.4-0.9 %
 on prefill), so the next honest step is not another micro-optimisation: it is
@@ -502,7 +508,7 @@ So the opt-in HIP paths are **faster at every level that can be measured
 precisely, and indistinguishable end-to-end because the end-to-end measurement
 cannot resolve ~0.5 %.** There is no clean end-to-end win to flip a default on,
 which is exactly the condition PR #64 sets for S6 — so the defaults correctly
-stay "0".
+stay "0". *(Superseded 2026-10-16 — see the closing "S6 — defaults flipped" section.)*
 
 **Lesson for anyone continuing:** this box's prefill throughput has a ~±1 %
 between-arm spread that is not ordering, so any single off-then-on comparison
@@ -644,7 +650,7 @@ Code: `csrc/rocm/hc_rdna2.cu` · Dispatcher:
   Triton-or-HIP path).
 - [ ] **S5 bench** — production shape `(B=2048, DIM=5120, NG=4)`. Target
   ≥ +20% over Triton.
-- [ ] **S6 default-on** — once S1-S5 pass, flip env-var default.
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ### hc_silu_rdna2
 
@@ -654,7 +660,7 @@ Code: `csrc/rocm/hc_rdna2.cu` · Dispatcher:
 - [ ] **S5 bench** — production shape `(B=2048, DIM=320)`. Silu + 1/HC
   scale is bandwidth-bound; expect +20-40% over Triton (vec8 loads,
   no Triton block overhead).
-- [ ] **S6 default-on**
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ### hc_gate_mix_rdna2
 
@@ -665,14 +671,14 @@ Code: `csrc/rocm/hc_rdna2.cu` · Dispatcher:
 - [ ] **S5 bench** — production shape `(B=2048, DIM=5120, HC=4)`. The
   constexpr unroll over `HC` should win over Triton's `static_range`;
   target +20%.
-- [ ] **S6 default-on**
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ### hc_combine_rdna2
 
 - [ ] **S0 build**
 - [ ] **S1 parity** — elementwise affine; `atol=1e-3`.
 - [ ] **S5 bench** — production shape `(B=2048, DIM=5120, HC=4)`.
-- [ ] **S6 default-on**
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ### hc_combine_norm_rdna2
 
@@ -683,7 +689,7 @@ Code: `csrc/rocm/hc_rdna2.cu` · Dispatcher:
 - [ ] **S5 bench** — production shape `(B=2048, DIM=5120, HC=4)`.
   Single-pass over the data should win over two launches; target
   +30-40% over the `(hc_combine, rmsnorm)` Triton sequence.
-- [ ] **S6 default-on**
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ---
 
@@ -733,7 +739,7 @@ HIP-vs-Triton delta that does not name its timer.
   256-thread block, so only the 16 threads holding a 16-byte vector were
   ever active. It now spans `256 / (WIDTH / 8)` rows per block, which is
   what closed the gap.
-- [ ] **S6 default-on**
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ### qsa_compress_groups_rdna2
 
@@ -758,7 +764,7 @@ HIP-vs-Triton delta that does not name its timer.
   accumulator.
 - [x] **S5b correctness guard** — `head_dim > 128` used to be silently
   truncated to `BLOCK_D`; it is now a `TORCH_CHECK`.
-- [ ] **S6 default-on**
+- [x] **S6 default-on** — flipped 2026-10-16 (see closing section).
 
 ### qsa_mqa_paged_rdna2
 
@@ -808,8 +814,8 @@ HIP-vs-Triton delta that does not name its timer.
   a head accumulated into a single register, a 64-deep dependent chain. Now
   128-bit loads and four independent accumulator chains:
   dense 4558 -> 3199 us (+27 % -> -10 %), early 683 -> 601 us.
-- [ ] **S6 default-on** — deferred until the real-forward S3 run lands.
-- [ ] **S6 default-on** — deferred until the real-forward S3 run lands.
+- [x] **S6 default-on** — flipped 2026-10-16; the S3 real-forward run landed (see closing section).
+- [x] **S6 default-on** — flipped 2026-10-16; the S3 real-forward run landed (see closing section).
 
 ---
 
@@ -920,8 +926,10 @@ Code: `csrc/rocm/gdn_prefill_delta_h_rdna2.cu` · Dispatcher:
   should be at roughly -4 % now — still a regression, because the other four
   GDN prefill kernels are unprofiled. Re-measuring it is the first item in
   "Next actions".
-- [ ] **S6 default-on** — do not flip: the gate is a measured prefill
-  regression and the remaining kernels have not been profiled.
+- [x] **S6 default-on** — flipped 2026-10-16. The 2026-10-15 kernel rewrites
+  (prep, kkt, solve_wy, o, delta_h) removed the prefill regression; a gates-only
+  A/B/A is +1-7 % and GSM8K is 150/150 identical. See the closing
+  "S6 — defaults flipped" section.
 
 ---
 
@@ -1242,9 +1250,12 @@ QSA only.
    `solve_wy` is LDS-bound at 59392 B -> 1 workgroup/CU.
 4. **[S3]** Re-run the serving A/B at higher concurrency and with prefix-cache
    hits; every number here is concurrency-1 and zero-cache.
-5. **[S6 default-on]** Both gates stay "0". The gates are a ~1.2 % prefill
-   cost with no measurable decode benefit; there is no clean win to flip on.
-   Note the PR's own exit criterion is "flip defaults only on a clean win".
+5. **[S6 default-on] DONE 2026-10-16.** The five per-op gates are now on by
+   default (QSA/HC/GDN code defaults flipped to `"1"`; the two conv1d gates
+   already were), and `VLLM_RDNA_ALL_HIP` / `VLLM_RDNA_PLE_CONV_HIP` stay `"0"`.
+   The "~1.2 % prefill cost" above was an artefact of the pre-rewrite kernels —
+   the gates-only A/B/A is +1-7 % prefill. See the closing
+   "S6 — defaults flipped" section.
 6. **[env]** The `TUNABLEOP_PROFILE=rocm10-rocblas5.6` pin is now **fixed**
    (commit 040b4afeb1 re-registered it against the loaded build `d05939967b5f`;
    44/44 lookup hits). No action. The untracked legacy
@@ -1625,3 +1636,56 @@ Not yet measured: the end-to-end size of the 256/512 win. It only materialises w
 controller is in the shared cell, so a single-request prefill benchmark will not show it —
 that needs a mixed-load run with ≥4 eligible requests plus a `[dyn-prefill] ADJUST` line
 confirming a 512 cap.
+
+---
+
+## S6 — defaults flipped (2026-10-16)
+
+`VLLM_RDNA_QSA_HIP`, `VLLM_RDNA_HC_PREFILL_HIP` and `VLLM_GDN_HIP_PREFILL` are
+now `"1"` by default. `VLLM_RDNA_ALL_HIP` stays `"0"` (29 call sites, cross-model
+blast radius, and its prefill win is just these gates' win);
+`VLLM_RDNA_PLE_CONV_HIP` was not in the measured set and stays `"0"`.
+
+### Decisive measurement — order-controlled gates-only A/B/A
+`off -> on -> off`, three fresh servers, umbrella `0` in all three arms, prefix
+caching off, `VLLM_RDNA_DYNAMIC_PREFILL=0`, 19 cases/arm, 0 failures
+(`tools/rdna2/e2e_prefill_ab.sh gates`; logs
+`.pi/sweep_{triton_gc_off1,gates_gc_on,triton_gc_off2}/`). `drift` = off2 vs off1
+(identical config), `delta` = on vs mean(off1, off2). Values = total tok/s.
+
+| scenario | conc | off1 | on | off2 | drift | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| 1k | 4 | 1777.8 | 1879.5 | 1797.8 | +1.12 % | **+5.13 %** |
+| 1k | 8 | 1835.0 | 1993.9 | 1890.7 | +3.03 % | **+7.04 %** |
+| 1k | 32 | 1868.3 | 1983.0 | 1880.8 | +0.67 % | **+5.78 %** |
+| 2k | 1 | 1799.4 | 1843.0 | 1791.0 | -0.46 % | **+2.66 %** |
+| 2k | 4 | 1789.7 | 1850.3 | 1794.0 | +0.24 % | **+3.26 %** |
+| 2k | 16 | 1784.4 | 1836.3 | 1781.9 | -0.14 % | **+2.98 %** |
+| 8k | 8 | 1750.2 | 1776.6 | 1754.3 | +0.23 % | **+1.39 %** |
+| 16k | 8 | 1729.3 | 1744.4 | 1734.8 | +0.32 % | **+0.71 %** |
+
+Drift is ±0.5 % at 2k/8k/16k, so +3 % is 6x the noise; TTFT p50 tracks it
+(-2.7..-3.2 % at 2k). The win decays with prompt length (1k ~+6 %, 2k ~+3 %,
+8k ~+1.3 %, 16k ~+0.7 %), because QSA/GDN/HC are a fixed slice while 16k is
+dominated by full-context attention identical in both arms. This supersedes
+Round 7 (gates-only prefill was -1.4 % / -0.7 % on the pre-rewrite build) and
+the umbrella+gates sweep, whose +2.5-5.4 % at 1k/2k showed the umbrella adds
+nothing over the gates.
+
+### Accuracy — GSM8K parity (a substitution, not the repo eval)
+`.pi/gsm8k_g_{off,on}.json`: 150 GSM8K questions, 5-shot, greedy
+(`temperature=0`, `seed=42`), chat endpoint, `max_tokens=1024`. **off 0.9800
+(147/150), on 0.9800 (147/150), 0 discordant pairs, 150/150 identical answers.**
+Not pinned at ceiling (3 wrong), so the test could have detected a difference.
+`evalscope` is not installed, so the prescribed
+`tests/evals/qwen4_exp/test_accuracy.py` (GSM8K + AIME25 thresholds) did not run.
+
+### Owed, not done
+* **A TP=4 PP / logit-fidelity run for the GDN gate.** The old "6.4 % lower PP"
+  claim is pre-fix (2026-10-07, `e8d1701784`) and was never re-measured; GSM8K
+  cannot rule out a logit-fidelity change. Counter-evidence: the kernels have
+  fp16-ulp-scaled parity tests against an fp64 oracle, and for `delta_h` HIP is
+  the *more* accurate side (6.8e-4 vs 2.5e-3).
+* `tools/rdna/recipes/flashnext*.env` also had to change (they pinned
+  `VLLM_GDN_HIP_PREFILL=0`, and `serve_rdna.sh` re-applies the caller env over
+  the recipe, so the code default alone would not have reached the launcher).

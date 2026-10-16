@@ -53,9 +53,9 @@ Both load via `vllm/models/qwen4_exp/amd/model.py` (the
 ## What this PR adds (opt-in scaffolding)
 
 Three new HIP files, three new env-var gates, three Python dispatcher
-modules. The default everywhere is **Triton** — these are flags you turn
-on once you've validated the HIP path matches Triton's output on the
-target shapes.
+modules. **The HC prefill and QSA gates are now on by default** (2026-10-16);
+the PLE short-conv gate is still opt-in. See `tuning.md` for the current
+defaults and `qwen4_exp_hip_tracker.md` for the evidence.
 
 ### 1. HC prefill HIP
 

@@ -65,9 +65,9 @@ run_arm() { # label  env...
   local tag="$label${SWEEP_TAG:-}"
   stop_server
   env "$@" bash tools/rdna2/serve_v620_stable.sh \
-    >".pi/e2e_$label.server.log" 2>&1 &
+    >".pi/e2e_$tag.server.log" 2>&1 &
   if ! wait_ready; then
-    tail -30 ".pi/e2e_$label.server.log"
+    tail -30 ".pi/e2e_$tag.server.log"
     stop_server || true
     return 1
   fi
@@ -94,13 +94,26 @@ HIP_ENV=(
   VLLM_CAUSAL_CONV1D_RDNA2_UPDATE=1
 )
 
+# The five per-op gates ON with the umbrella OFF. This isolates the prefill ports
+# from the umbrella's decode-side kernel set, and it is the arm pair the tracker's
+# order-controlled A/B/A used (docs/rdna2/qwen4_exp_hip_tracker.md, Round 7).
+GATES_ENV=(
+  VLLM_RDNA_ALL_HIP=0
+  VLLM_RDNA_QSA_HIP=1
+  VLLM_GDN_HIP_PREFILL=1
+  VLLM_RDNA_HC_PREFILL_HIP=1
+  VLLM_CAUSAL_CONV1D_RDNA2_FWD=1
+  VLLM_CAUSAL_CONV1D_RDNA2_UPDATE=1
+)
+
 case "$arms" in
   triton) run_arm triton "${TRITON_ENV[@]}" || echo "arm triton FAILED" ;;
   hip) run_arm hip "${HIP_ENV[@]}" || echo "arm hip FAILED" ;;
+  gates) run_arm gates "${GATES_ENV[@]}" || echo "arm gates FAILED" ;;
   both)
     run_arm triton "${TRITON_ENV[@]}" || echo "arm triton FAILED"
     run_arm hip "${HIP_ENV[@]}" || echo "arm hip FAILED"
     ;;
-  *) echo "usage: $0 [both|triton|hip]"; exit 2 ;;
+  *) echo "usage: $0 [both|triton|hip|gates]"; exit 2 ;;
 esac
 echo "=== logs in $repo/.pi/sweep_{triton,hip}/ ==="

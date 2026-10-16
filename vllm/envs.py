@@ -333,11 +333,11 @@ if TYPE_CHECKING:
     VLLM_RDNA_DENSE_INT8: bool = False
     VLLM_RDNA_FUSED_HC: bool = True
     VLLM_RDNA_FUSED_SE: bool = True
-    # Qwen4Exp / Qwen3.8-Flash-Next on gfx1030: opt-in HIP paths for the
-    # HC prefill kernels, QSA decode kernels, and PLE dilated short-conv.
-    # Default off (Triton) until the HIP ports are verified end-to-end.
-    VLLM_RDNA_HC_PREFILL_HIP: bool = False
-    VLLM_RDNA_QSA_HIP: bool = False
+    # Qwen4Exp / Qwen3.8-Flash-Next on gfx1030: HIP paths for the HC prefill
+    # and QSA decode kernels (default on: +1-7% end-to-end, GSM8K parity), and
+    # the PLE dilated short-conv (default off, not yet end-to-end measured).
+    VLLM_RDNA_HC_PREFILL_HIP: bool = True
+    VLLM_RDNA_QSA_HIP: bool = True
     VLLM_RDNA_PLE_CONV_HIP: bool = False
     # Umbrella opt-in for the whole RDNA2 HIP kernel set (worker/sampler,
     # top-k/top-p masking, QSA metadata, MTP conv1d + GDN spec-verify,
@@ -2196,9 +2196,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RDNA_FUSED_HC": lambda: os.getenv("VLLM_RDNA_FUSED_HC", "1") == "1",
     "VLLM_RDNA_FUSED_SE": lambda: os.getenv("VLLM_RDNA_FUSED_SE", "1") == "1",
     "VLLM_RDNA_HC_PREFILL_HIP": lambda: (
-        os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0") == "1"
+        os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "1") == "1"
     ),
-    "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "0") == "1",
+    "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "1") == "1",
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
     "VLLM_RDNA_ALL_HIP": lambda: os.getenv("VLLM_RDNA_ALL_HIP", "0") == "1",
     # Log model inspection after loading.

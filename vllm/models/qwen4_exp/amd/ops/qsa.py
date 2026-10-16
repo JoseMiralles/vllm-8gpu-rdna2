@@ -14,7 +14,7 @@ from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-# Opt-in HIP port of the simpler QSA kernels (store_cache_rows +
+# HIP port of the simpler QSA kernels (store_cache_rows +
 # compress_groups). When ``VLLM_RDNA_QSA_HIP=1`` AND ``on_gfx10x()`` is
 # true, the helpers below route through the HIP bindings; otherwise they
 # fall through to the Triton kernels unchanged. The splitk attention

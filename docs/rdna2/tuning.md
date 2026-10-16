@@ -94,14 +94,15 @@ actually sets.
 | Env | Default | Notes |
 |---|---|---|
 | `VLLM_GDN_DECODE_RDNA2` | 1 | HIP GDN decode. |
-| `VLLM_GDN_HIP_PREFILL` | 0 | HIP GDN prefill prep. Off in recipes. |
+| `VLLM_GDN_HIP_PREFILL` | 1 | HIP GDN prefill chain (prep/solve-WY/delta-h/o). On by default since the 2026-10-15 kernel rewrites; faster than Triton at every served shape. |
 | `VLLM_RDNA_GDN_OPAQUE` | 1 | Whole GDN layer as one opaque op. 0 keeps the projections in the compiled graph. |
 | `VLLM_CAUSAL_CONV1D_RDNA2_FWD`, `_UPDATE` | 1 | HIP causal conv1d. Recipes set 0 (Triton). |
 | `VLLM_RDNA_FUSED_HC` | 1 | Fused hyper-connection decode (Flash-Next). |
 | `VLLM_RDNA_HC_PREFILL_FUSED` | 2 | HC prefill: 0 torch+Triton, 1 fused mix kernel, 2 split-K HIP down + fused kernel. |
 | `VLLM_RDNA_HC_PAD_M` | 64 | Pad HC row counts to the 64-step grid that has TunableOp rows. 0 disables (and loses ~60 ms per 512-token mixed step). |
-| `VLLM_RDNA_HC_PREFILL_HIP`, `VLLM_RDNA_PLE_CONV_HIP` | 0 | Opt-in HIP ports, not end-to-end verified. |
-| `VLLM_RDNA_QSA_HIP` | 0 | HIP QSA path. Fault-free but 4–10 % slower than Triton; keep off. |
+| `VLLM_RDNA_HC_PREFILL_HIP` | 1 | HIP hyper-connection prefill. On by default (end-to-end verified). |
+| `VLLM_RDNA_PLE_CONV_HIP` | 0 | Opt-in HIP PLE dilated short-conv; not end-to-end verified. |
+| `VLLM_RDNA_QSA_HIP` | 1 | HIP QSA path. On by default: faster than Triton at all nine served shapes. |
 | `VLLM_RDNA_ALL_HIP` | 0 | Umbrella opt-in for the RDNA2 HIP kernel set: worker/sampler, top-k/top-p masking, QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE, vision pos-embed. With it unset gfx10x runs the Triton kernels it ran before the port; with it set the Triton audit shows zero launches and decode is ~99 vs ~89 tok/s (V620, TP4, MTP-2). Independent of the per-op flags above. |
 | `VLLM_RDNA_MROPE_BLOCK` | auto | HIP M-RoPE block size. `auto` = one block per token, striding the rotary index across the block; `1` restores the one-thread-per-token launch, which at decode (3 tokens) runs 3 threads and makes the kernel ~50x slower (494 vs 10 us, gfx1030). |
 
