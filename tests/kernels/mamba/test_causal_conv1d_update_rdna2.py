@@ -176,10 +176,15 @@ def test_strided_x_inplace_and_padded_slot(monkeypatch):
 
 
 @pytest.mark.parametrize("capacity", [5, 7])
-def test_update_ignores_spec_state_capacity(capacity, monkeypatch):
+def test_update_kernel_ignores_spec_state_capacity(capacity):
     """MTP sizes the conv state as width - 1 + num_spec. The HIP kernel must
     consume only the first width - 1 columns (like the Triton kernel's
-    effective state_len) and leave the extra capacity untouched."""
+    effective state_len) and leave the extra capacity untouched.
+
+    The op is called directly: the dispatch guard requires
+    ``conv_state.size(2) == width - 1``, so an oversized cache never reaches it
+    from the dispatcher.
+    """
     batch, dim, width, lines = 16, 1024, 4, 32
     assert capacity > width - 1
     x, state, weight, bias, indices = _make(
@@ -187,52 +192,126 @@ def test_update_ignores_spec_state_capacity(capacity, monkeypatch):
     )
     assert state.size(2) == capacity
     ref_out, ref_state = _reference(x, state, weight, bias, indices, True)
-    out = _run_hip(x, state, weight, bias, indices, True, monkeypatch)
+    x3 = x.unsqueeze(-1)
+    out = torch.empty_like(x3)
+    torch.ops._rocm_C.causal_conv1d_update_rdna2(
+        x3, state, weight, bias, out, indices, True
+    )
     torch.accelerator.synchronize()
-    torch.testing.assert_close(out, ref_out, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(out.squeeze(-1), ref_out, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(state, ref_state, atol=0, rtol=0)
 
 
-def test_fwd_ignores_spec_state_capacity(monkeypatch):
-    """The varlen HIP conv must match Triton for an MTP-sized conv state."""
-    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+def test_hip_conv_state_gate_is_opt_in(monkeypatch):
+    """An over-capacity (MTP-sized) conv state only takes HIP when opted in.
 
+    MTP sizes the conv state as width - 1 + num_spec; the HIP kernels ignore the
+    extra columns, but that is only validated for this model, so the dispatcher
+    must keep it behind VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE (default off).
+    """
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        _hip_conv_state_ok,
+    )
+
+    width = 4
+    exact = torch.zeros(4, 8, width - 1)
+    over = torch.zeros(4, 8, width - 1 + 2)
+    under = torch.zeros(4, 8, width - 2)
+    monkeypatch.delenv("VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE", raising=False)
+    assert _hip_conv_state_ok(exact, width)
+    assert not _hip_conv_state_ok(over, width)
+    assert not _hip_conv_state_ok(under, width)
+    monkeypatch.setenv("VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE", "1")
+    assert _hip_conv_state_ok(exact, width)
+    assert _hip_conv_state_ok(over, width)
+    assert not _hip_conv_state_ok(under, width)
+
+
+def test_update_dispatch_admits_over_capacity_state_only_when_opted_in(monkeypatch):
+    """The opt-in is what lets the HIP update kernel see an MTP-sized state."""
+    batch, dim, width, lines = 4, 256, 4, 32
+    x, state, weight, bias, indices = _make(
+        batch, dim, width, lines, 7, True, state_capacity=width - 1 + 2
+    )
+    assert state.size(2) > width - 1
+    monkeypatch.setenv("VLLM_CAUSAL_CONV1D_RDNA2_UPDATE", "1")
+    calls: list[int] = []
+    monkeypatch.setattr(
+        torch.ops._rocm_C,
+        "causal_conv1d_update_rdna2",
+        lambda *a, **k: calls.append(1),
+    )
+
+    def run():
+        return causal_conv1d_update(
+            x.clone(), state, weight, bias, "silu", conv_state_indices=indices
+        )
+
+    monkeypatch.delenv("VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE", raising=False)
+    run()
+    assert calls == []
+    monkeypatch.setenv("VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE", "1")
+    run()
+    assert calls == [1]
+
+
+def test_fwd_kernel_ignores_spec_state_capacity():
+    """The varlen HIP conv op must ignore conv-state capacity past width - 1.
+
+    MTP sizes the conv state as width - 1 + num_spec. The op is called directly
+    because the dispatch guard requires ``conv_states.size(2) == width - 1``, so
+    an oversized cache never reaches it from the dispatcher. ``x`` is
+    channel-last, as the serving path passes it.
+    """
     batch, dim, width, seqlen, capacity = 3, 256, 4, 5, 6
     lines = 8
+    state_len = width - 1
     g = torch.Generator(device=DEVICE).manual_seed(11)
     total = batch * seqlen
-    x = torch.randn(dim, total, device=DEVICE, dtype=torch.float16, generator=g)
+    x = torch.randn(total, dim, device=DEVICE, dtype=torch.float16, generator=g)
+    x = x.transpose(0, 1)
     weight = torch.randn(dim, width, device=DEVICE, dtype=torch.float16, generator=g)
     bias = torch.randn(dim, device=DEVICE, dtype=torch.float16, generator=g)
+    # Both caches hold the same history; the oversized one carries extra
+    # capacity that must be neither read nor written.
+    history = torch.randn(
+        lines, state_len, dim, device=DEVICE, dtype=torch.float16, generator=g
+    )
     storage = torch.randn(
         lines, capacity, dim, device=DEVICE, dtype=torch.float16, generator=g
     )
-    state_hip = storage.transpose(-1, -2)
-    state_tri = state_hip.clone()
+    storage[:, :state_len] = history
     query_start_loc = torch.arange(
         0, total + 1, seqlen, dtype=torch.int32, device=DEVICE
     )
     cache_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
     has_initial_state = torch.ones(batch, dtype=torch.bool, device=DEVICE)
 
-    def run(conv_states, gate):
-        monkeypatch.setenv("VLLM_CAUSAL_CONV1D_RDNA2_FWD", gate)
-        return causal_conv1d_fn(
+    def run(state):
+        out = torch.empty_like(x)
+        torch.ops._rocm_C.causal_conv1d_fwd_rdna2(
             x,
             weight,
             bias,
-            conv_states=conv_states,
-            query_start_loc=query_start_loc,
-            cache_indices=cache_indices,
-            has_initial_state=has_initial_state,
-            activation="silu",
+            state,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            out,
+            True,
+            0,
         )
+        return out
 
-    out_hip = run(state_hip, "1")
-    out_tri = run(state_tri, "0")
+    state_cap = storage.transpose(-1, -2)
+    state_min = history.clone().transpose(-1, -2)
+    spare = state_cap[..., state_len:].clone()
+    out_cap = run(state_cap)
+    out_min = run(state_min)
     torch.accelerator.synchronize()
-    assert torch.equal(out_hip, out_tri)
-    assert torch.equal(state_hip, state_tri)
+    assert torch.equal(out_cap, out_min)
+    assert torch.equal(state_cap[..., :state_len], state_min)
+    assert torch.equal(state_cap[..., state_len:], spare)
 
 
 # =============================================================================
@@ -258,9 +337,7 @@ def _make_spec(n_req, dim, lens, accepted, transposed=True, seed=0, capacity=Non
     capacity = SPEC_CAPACITY if capacity is None else capacity
     lines = 1 + n_req * (1 + SPEC_NUM_SPEC)
     g = torch.Generator(device=DEVICE).manual_seed(seed)
-    x = torch.randn(
-        sum(lens), dim, device=DEVICE, dtype=torch.float16, generator=g
-    )
+    x = torch.randn(sum(lens), dim, device=DEVICE, dtype=torch.float16, generator=g)
     weight = (
         torch.randn(dim, SPEC_WIDTH, device=DEVICE, dtype=torch.float16, generator=g)
         * 0.5
@@ -277,8 +354,9 @@ def _make_spec(n_req, dim, lens, accepted, transposed=True, seed=0, capacity=Non
             lines, dim, capacity, device=DEVICE, dtype=torch.float16, generator=g
         )
     indices = (
-        torch.arange(n_req * (1 + SPEC_NUM_SPEC), device=DEVICE, dtype=torch.int32)
-        .reshape(n_req, 1 + SPEC_NUM_SPEC)
+        torch.arange(
+            n_req * (1 + SPEC_NUM_SPEC), device=DEVICE, dtype=torch.int32
+        ).reshape(n_req, 1 + SPEC_NUM_SPEC)
         + 1
     )
     query_start_loc = torch.zeros(n_req + 1, device=DEVICE, dtype=torch.int32)
@@ -418,7 +496,7 @@ def test_varlen_update_without_spec_matches_triton(monkeypatch):
 
 
 def test_spec_update_skips_null_block(monkeypatch):
-    """slot == NULL_BLOCK_ID: the Triton kernel returns before writing `out`,
+    """Slot == NULL_BLOCK_ID: the Triton kernel returns before writing `out`,
     leaving the caller's buffer untouched and the state intact."""
     x, state, weight, bias, indices, qsl, _ = _make_spec(3, 256, [3, 3, 3], [3, 3, 3])
     bad_indices = indices[:, 0].clone()

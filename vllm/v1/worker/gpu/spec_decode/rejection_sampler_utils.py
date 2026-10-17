@@ -1101,7 +1101,7 @@ def rejection_sample(
         and padded_vocab_num_blocks <= 32
         and (
             not has_draft_logits
-            or draft_logits.scalar_type() == torch.float32
+            or (draft_logits is not None and draft_logits.dtype == torch.float32)
         )
     )
     if _hip_stats_ok:
@@ -1144,7 +1144,7 @@ def rejection_sample(
             num_speculative_steps,
             BLOCK_SIZE=VOCAB_BLOCK_SIZE,
             HAS_DRAFT_LOGITS=has_draft_logits,
-      )
+        )
 
     # Precompute the running joint ratio and residual mass for block
     # verification.
@@ -1297,7 +1297,7 @@ def rejection_sample(
             SYNTHETIC_MODE=synthetic_conditional_rates is not None,
             USE_BLOCK_VERIFICATION=use_block_verification,
             num_warps=1,
-      )
+        )
 
     # Resample the rejected/bonus tokens.
     RESAMPLE_BLOCK_SIZE = 1024
@@ -1365,7 +1365,7 @@ def rejection_sample(
             USE_BLOCK_VERIFICATION=use_block_verification,
             CONTEXT_WIDTH=context_width,
             WATERMARK=watermark,
-      )
+        )
 
     # Insert the resampled tokens into the output sampled.
     if _ON_RDNA2 and num_reqs > 0:
@@ -1393,5 +1393,5 @@ def rejection_sample(
             expanded_idx_mapping,
             temperature,
             PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
-      )
+        )
     return sampled, num_sampled

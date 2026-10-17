@@ -16,6 +16,24 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
+def _hip_conv_state_ok(conv_state: torch.Tensor, width: int) -> bool:
+    """True when the HIP conv1d kernels may run on ``conv_state``.
+
+    The HIP kernels read and write only the first ``width - 1`` state columns,
+    like the Triton kernels' effective ``state_len``, so an over-capacity state
+    (spec decoding sizes it as ``width - 1 + num_spec``) would be safe -- but
+    that is only validated for this model, so it stays opt-in through
+    ``VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE``.
+    """
+    capacity = conv_state.size(2)
+    if capacity == width - 1:
+        return True
+    return (
+        capacity > width - 1
+        and os.environ.get("VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE", "0") == "1"
+    )
+
+
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -733,10 +751,9 @@ def causal_conv1d_fn(
         and is_channel_last
         and dim % 32 == 0
         and 2 <= width <= 5
-        # The HIP kernel consumes the first width - 1 state columns, like the
-        # Triton kernel's effective state_len, so a spec-sized (MTP) cache with
-        # extra capacity is fine as long as it holds at least width - 1.
-        and conv_states.size(2) >= width - 1
+        # Exact state_len unless VLLM_CAUSAL_CONV1D_RDNA2_SPEC_STATE opts in
+        # to the MTP-sized (over-capacity) conv state.
+        and _hip_conv_state_ok(conv_states, width)
         and cache_indices is not None
         and block_idx_last_scheduled_token is None
         and hasattr(torch.ops, "_rocm_C")
@@ -1296,19 +1313,11 @@ def causal_conv1d_update(
         and weight.dtype == torch.float16
         and (out.dtype == torch.float16 if out is not None else True)
         and dim % 32 == 0
-        # Same as the fwd dispatch: the HIP update uses the first width - 1
-        # state columns, so a spec-sized cache with extra capacity is fine.
-        and conv_state.size(2) >= width - 1
+        # Same state-width policy as the fwd dispatch.
+        and _hip_conv_state_ok(conv_state, width)
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "causal_conv1d_update_rdna2")
     ):
-        if not hasattr(torch.ops, "_rocm_C") or not hasattr(
-            torch.ops._rocm_C, "causal_conv1d_update_rdna2"
-        ):
-            # Loud on gfx10x: a silent fallback to Triton is a production
-            # regression (stale scratch pointers under FULL cudagraph replay).
-            raise RuntimeError(
-                "VLLM_CAUSAL_CONV1D_RDNA2_UPDATE is enabled on gfx10x but "
-                "causal_conv1d_update_rdna2 is not built; rebuild _rocm_C."
-            )
         # The kernel takes every stride (x/out/weight and the transposed
         # paged conv_state view), so nothing is copied and `out` is written
         # in place like the Triton path.
@@ -1351,14 +1360,9 @@ def causal_conv1d_update(
         # num_accepted_tokens / query_start_loc are read with a unit stride.
         and (num_accepted_tokens is None or num_accepted_tokens.stride(0) == 1)
         and (query_start_loc is None or query_start_loc.stride(0) == 1)
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "causal_conv1d_update_spec_rdna2")
     ):
-        if not hasattr(torch.ops, "_rocm_C") or not hasattr(
-            torch.ops._rocm_C, "causal_conv1d_update_spec_rdna2"
-        ):
-            raise RuntimeError(
-                "VLLM_CAUSAL_CONV1D_RDNA2_UPDATE is enabled on gfx10x but "
-                "causal_conv1d_update_spec_rdna2 is not built; rebuild _rocm_C."
-            )
         torch.ops._rocm_C.causal_conv1d_update_spec_rdna2(
             x,
             conv_state,

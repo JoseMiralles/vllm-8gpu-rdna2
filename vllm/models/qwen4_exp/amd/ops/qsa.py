@@ -966,16 +966,18 @@ def qsa_sparse_paged_attention(
     assert out.stride(2) == 1
     if not q.shape[0]:
         return out
-    if qsa_rdna2.qsa_use_rdna2(q.dtype):
-        return qsa_rdna2.qsa_sparse_paged_attention(
-            q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
-        )
-
+    # --monokernel's fused decode is HIP too and is the kernel its decode graph
+    # is built around, so an installed mono part takes the case ahead of the
+    # generic HIP kernel; a mono refusal still falls through to it.
     group_size = q.shape[1] // k_cache.shape[2]
     if MONO_QSA and MONO_QSA.sparse_decode(
         q, k_cache, v_cache, group_size, logical_indices, block_table, token_to_req, out
     ):
         return out
+    if qsa_rdna2.qsa_use_rdna2(q.dtype):
+        return qsa_rdna2.qsa_sparse_paged_attention(
+            q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        )
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4

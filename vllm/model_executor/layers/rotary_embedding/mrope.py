@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna2_hip
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -246,8 +247,9 @@ def mrope_forward_rdna2(
 ) -> bool:
     """Rotate q/k in place with the gfx1030 HIP M-RoPE kernel.
 
-    Returns False when the kernel is unavailable or the tensors do not match its
-    layout, so callers fall back to ``triton_mrope``.
+    Returns False when the RDNA2 HIP gates are off, the kernel is not built, or
+    the tensors do not match its layout, so callers fall back to
+    ``triton_mrope``.
 
     Args:
         query: [num_tokens, num_heads * head_size], fp16, dense.
@@ -274,9 +276,7 @@ def mrope_forward_rdna2(
         torch.ops._rocm_C, "mrope_forward_rdna2"
     ):
         return False
-    from vllm.platforms.rocm import on_gfx10x
-
-    if not on_gfx10x():
+    if not on_rdna2_hip():
         return False
     torch.ops._rocm_C.mrope_forward_rdna2(
         query,
@@ -580,11 +580,13 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
             query_shape = query.shape
             key_shape = key.shape
             cos_sin_cache = self._match_cos_sin_cache_dtype(query)
-            cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
-            if (
-                query.is_contiguous()
-                and key.is_contiguous()
-                and mrope_forward_rdna2(
+            # gfx1030: our HIP M-RoPE kernel replaces the Triton one (the
+            # dominant kernel in the TP=4 decode profile). The [3, T, rd/2]
+            # gather is only its input layout, so it stays behind the gate --
+            # the fallback op gathers the cache itself.
+            if on_rdna2_hip() and query.is_contiguous() and key.is_contiguous():
+                cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
+                if mrope_forward_rdna2(
                     query.view(positions.shape[-1], -1),
                     key.view(positions.shape[-1], -1),
                     cos,
@@ -594,9 +596,8 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
                     self.mrope_section,
                     self.mrope_interleaved,
                     self.is_neox_style,
-                )
-            ):
-                return query, key
+                ):
+                    return query, key
             torch.ops.vllm.mrope(
                 positions,
                 query,

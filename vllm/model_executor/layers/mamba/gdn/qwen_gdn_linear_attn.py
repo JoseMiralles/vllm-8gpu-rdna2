@@ -109,6 +109,13 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 # shape and dtype, and so are the caller's q and k -- a shape-only key makes
 # them alias one buffer and silently corrupts the result.
 #
+# One buffer per role, grown to the largest shape the role has needed and
+# viewed down per call: the shapes carry the prefill length and the chunk
+# count, so a per-shape cache allocated a fresh ~300 MB set for every distinct
+# prompt length (chunk remainders, mixed batches) and crept into VRAM after KV
+# sizing. The largest shape a role can reach is bounded by
+# --max-num-batched-tokens, so the total is bounded too.
+#
 # Every element is written by the kernels before it is read -- the
 # out-of-bounds rows are guarded at the read site (kkt zero-fills its LDS tile,
 # solve_wy its s_A, delta_h/o by t_len/valid_rows), not zero-filled at the
@@ -154,7 +161,8 @@ class _GdnPrefillTimer:
 
     def __init__(self, name):
         self.name = name
-        self.start = self.end = None
+        self.start: Any = None
+        self.end: Any = None
 
     def __enter__(self):
         if _GDN_PREFILL_TIMING:
@@ -178,11 +186,11 @@ class _GdnPrefillTimer:
     def _flush(cls):
         # One sync per call, after every end event has been recorded, so the
         # sync itself never falls inside a measured window.
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for name, start, end in cls._pending:
-            _GDN_PREFILL_TIMING_MS[name] = (
-                _GDN_PREFILL_TIMING_MS.get(name, 0.0) + start.elapsed_time(end)
-            )
+            _GDN_PREFILL_TIMING_MS[name] = _GDN_PREFILL_TIMING_MS.get(
+                name, 0.0
+            ) + start.elapsed_time(end)
             _GDN_PREFILL_TIMING_N[name] = _GDN_PREFILL_TIMING_N.get(name, 0) + 1
         cls._pending = []
         if _GDN_PREFILL_TIMING_N and max(_GDN_PREFILL_TIMING_N.values()) % 200 == 0:
@@ -194,21 +202,30 @@ class _GdnPrefillTimer:
 
 
 def _prefill_scratch(role, shape, dtype, device):
-    key = (role, tuple(shape), dtype, str(device))
+    """Return a zeroed scratch tensor of ``shape`` for ``role``.
+
+    The buffer is grown to the largest shape the role has asked for and viewed
+    down, so the cache holds one entry per role (see _GDN_PREFILL_SCRATCH).
+    """
+    key = (role, dtype, str(device))
     buf = _GDN_PREFILL_SCRATCH.get(key)
-    if buf is None:
+    if buf is None or any(s > b for s, b in zip(shape, buf.shape)):
+        grown = (
+            tuple(max(s, b) for s, b in zip(shape, buf.shape))
+            if buf is not None
+            else tuple(shape)
+        )
         # zeros, not empty: this still commits the pages, which cudagraph
         # capture relies on, but only once instead of once per call.
-        buf = torch.zeros(shape, dtype=dtype, device=device)
+        buf = torch.zeros(grown, dtype=dtype, device=device)
         _GDN_PREFILL_SCRATCH[key] = buf
-    return buf
+    return buf[tuple(slice(0, s) for s in shape)].view(shape)
 
 
 def _timed_call(fn, *args, **kwargs):
     """Run fn under the GDN prefill timer (see _GdnPrefillTimer)."""
     with _GdnPrefillTimer("prep"):
         return fn(*args, **kwargs)
-
 
 
 def _gdn_prefill_chain_rdna2(
@@ -756,6 +773,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._init_gdn_state_arenas()
 
         mono = MONO_GDN_HOOK(self, vllm_config) if MONO_GDN_HOOK else None
+        self._mono_gdn_op: Any
+        self._mono_gdn: Any
         self._mono_gdn_op, self._mono_gdn = mono if mono else (None, None)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -1984,7 +2003,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     value_non_spec,
                     g_non_spec,
                     beta_non_spec,
-                ) = _timed_call(fused_post_conv_prep,
+                ) = _timed_call(
+                    fused_post_conv_prep,
                     conv_output=conv_output_prefill,
                     a=a_prefill,
                     b=b_prefill,
