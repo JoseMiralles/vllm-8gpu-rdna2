@@ -104,8 +104,14 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_off_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
-            self._mamba_collapse_acceptance_gpu = torch.zeros(
-                self.max_num_reqs, dtype=torch.bool, device=self.device
+            # Dynamic speculation only: commit the accepted-token state when a
+            # request drops to zero drafts (fixed K never takes this path).
+            spec_config = vllm_config.speculative_config
+            self._mamba_collapse_acceptance_gpu = (
+                torch.zeros(self.max_num_reqs, dtype=torch.bool, device=self.device)
+                if spec_config is not None
+                and spec_config.uses_dynamic_speculative_decoding()
+                else None
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []

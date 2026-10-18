@@ -67,6 +67,8 @@ def test_ple_capture_matches_dynamic_decode_metadata(device, drafts):
     config.speculative_config = SpeculativeConfig(
         method="ngram", num_speculative_tokens=4
     )
+    # zero-draft rows take ordinary decode only under dynamic speculation
+    config.speculative_config.num_speculative_tokens_per_batch_size = [[1, 256, 4]]
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     config.compilation_config.max_cudagraph_capture_size = 32
     builder = PleShortConvAttentionMetadataBuilder(
@@ -132,6 +134,21 @@ def test_ple_capture_matches_dynamic_decode_metadata(device, drafts):
         )
         assert zero_marked.num_spec_decodes == 0
         assert zero_marked.num_decodes == 2
+
+        # A fixed K keeps zero-draft rows on the spec path, as GDN / Mamba do.
+        config.speculative_config.num_speculative_tokens_per_batch_size = None
+        fixed = PleShortConvAttentionMetadataBuilder(
+            MambaSpec(block_size=16, shapes=((16, 64),), dtypes=(torch.float32,)),
+            ["ple"],
+            config,
+            device,
+        ).build(
+            0,
+            runtime_common,
+            num_accepted_tokens=torch.ones(2, dtype=torch.int32, device=device),
+            num_decode_draft_tokens_cpu=torch.zeros(2, dtype=torch.int32),
+        )
+        assert fixed.num_spec_decodes == 2
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
