@@ -649,6 +649,14 @@ _logging.getLogger(__name__).info(
 )
 
 
+def _hip_scorer():
+    """The MonoKernel's HIP scoring module, for the HIP QSA path without
+    --monokernel (one kernel and one shape policy on both paths)."""
+    from ..mono.rdna2 import qsa as mono_qsa
+
+    return mono_qsa
+
+
 def _validate_mqa(q: torch.Tensor) -> None:
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
         raise ValueError("QSA query must be [rows, heads, head_dim]")
@@ -694,26 +702,18 @@ def qsa_mqa_paged(
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
 
-    # --monokernel scores with its own HIP kernel, or Triton with the early
-    # exit where that is faster (mqa_config); the generic HIP kernel below has
-    # no early exit, so it serves only the path without the MonoKernel.
-    if MONO_QSA is None and qsa_rdna2.qsa_use_rdna2(q.dtype):
-        return qsa_rdna2.qsa_mqa_paged(
-            q,
-            k_cache,
-            page_table,
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            compress_ratio,
-            columns,
-            float(score_divisor),
-        )
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
-    if MONO_QSA is not None and MONO_QSA.mqa_paged(
+    # gfx10x HIP scoring with the early exit (mono_qsa_mqa_rdna2, its own shape
+    # policy) under --monokernel, and on the HIP QSA path without it; where
+    # the policy keeps Triton, the Triton kernel below runs with the early
+    # exit too. Valid for every call here: the ROCm top-k reads [0, visible).
+    hip_path = MONO_QSA is None and qsa_rdna2.qsa_use_rdna2(q.dtype)
+    early_exit = (MONO_QSA is not None or hip_path) and not current_platform.is_cuda()
+    scorer = MONO_QSA if MONO_QSA is not None else _hip_scorer() if hip_path else None
+    if scorer is not None and scorer.mqa_paged(
         q,
         k_cache,
         page_table,
@@ -758,7 +758,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
-        EARLY_EXIT=1 if MONO_QSA and not current_platform.is_cuda() else 0,
+        EARLY_EXIT=1 if early_exit else 0,
         num_warps=_QSA_MQA_WARPS,
         **_qsa_mqa_extra,
     )

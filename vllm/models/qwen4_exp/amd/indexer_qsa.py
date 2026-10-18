@@ -154,6 +154,17 @@ class QSAIndexer(nn.Module):
 
         # MonoKernel QSA part (--monokernel on gfx10x), else None
         self._mono_qsa = mono_decode_rdna2.qsa_part(vllm_config)
+        from .ops import qsa_rdna2
+
+        # The HIP QSA path without --monokernel runs the MonoKernel's indexer
+        # epilogue (one launch) and scoring (kernel + shape policy, which
+        # needs the decode width).
+        self._hip_qsa = self._mono_qsa
+        if self._mono_qsa is None and qsa_rdna2.qsa_use_rdna2():
+            from .mono.rdna2 import qsa as mono_qsa
+
+            mono_qsa.DECODE_WIDTH = 1 + vllm_config.num_speculative_tokens
+            self._hip_qsa = mono_qsa
 
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
@@ -420,9 +431,9 @@ class QSAIndexer(nn.Module):
         num_tokens = raw_metadata.num_actual_tokens
         qk, _ = self.index_qk_proj(hidden_states[:num_tokens])
         q = None
-        if self._mono_qsa is not None:
+        if self._hip_qsa is not None:
             # q norm+RoPE, pooling, k norm+RoPE and the stores in one launch
-            q = self._mono_qsa.epilogue(
+            q = self._hip_qsa.epilogue(
                 self.q_layernorm,
                 self.k_layernorm,
                 self.rotary_emb,
