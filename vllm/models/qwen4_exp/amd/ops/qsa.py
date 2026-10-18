@@ -694,7 +694,10 @@ def qsa_mqa_paged(
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
 
-    if qsa_rdna2.qsa_use_rdna2(q.dtype):
+    # --monokernel scores with its own HIP kernel, or Triton with the early
+    # exit where that is faster (mqa_config); the generic HIP kernel below has
+    # no early exit, so it serves only the path without the MonoKernel.
+    if MONO_QSA is None and qsa_rdna2.qsa_use_rdna2(q.dtype):
         return qsa_rdna2.qsa_mqa_paged(
             q,
             k_cache,
