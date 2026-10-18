@@ -79,7 +79,11 @@ def sparse_decode(
         _log_once("sparse decode", q.shape[0], False)
         return False
     _log_once("sparse decode", q.shape[0], True)
-    dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    dev = (
+        q.device.index
+        if q.device.index is not None
+        else torch.accelerator.current_device_index()
+    )
     counters = _COUNTERS.get(dev)
     if counters is None:  # QSA runs as an eager break: never allocated under capture
         counters = torch.zeros(64 * 64, dtype=torch.int32, device=q.device)
