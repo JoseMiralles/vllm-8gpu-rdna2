@@ -14,7 +14,7 @@ from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-# Opt-in HIP port of the simpler QSA kernels (store_cache_rows +
+# HIP port of the simpler QSA kernels (store_cache_rows +
 # compress_groups). When ``VLLM_RDNA_QSA_HIP=1`` AND ``on_gfx10x()`` is
 # true, the helpers below route through the HIP bindings; otherwise they
 # fall through to the Triton kernels unchanged. The splitk attention
@@ -649,6 +649,14 @@ _logging.getLogger(__name__).info(
 )
 
 
+def _hip_scorer():
+    """The MonoKernel's HIP scoring module, for the HIP QSA path without
+    --monokernel (one kernel and one shape policy on both paths)."""
+    from ..mono.rdna2 import qsa as mono_qsa
+
+    return mono_qsa
+
+
 def _validate_mqa(q: torch.Tensor) -> None:
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
         raise ValueError("QSA query must be [rows, heads, head_dim]")
@@ -693,11 +701,19 @@ def qsa_mqa_paged(
     columns = capacity if num_columns is None else num_columns
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
+
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
-    if MONO_QSA is not None and MONO_QSA.mqa_paged(
+    # gfx10x HIP scoring with the early exit (mono_qsa_mqa_rdna2, its own shape
+    # policy) under --monokernel, and on the HIP QSA path without it; where
+    # the policy keeps Triton, the Triton kernel below runs with the early
+    # exit too. Valid for every call here: the ROCm top-k reads [0, visible).
+    hip_path = MONO_QSA is None and qsa_rdna2.qsa_use_rdna2(q.dtype)
+    early_exit = (MONO_QSA is not None or hip_path) and not current_platform.is_cuda()
+    scorer = MONO_QSA if MONO_QSA is not None else _hip_scorer() if hip_path else None
+    if scorer is not None and scorer.mqa_paged(
         q,
         k_cache,
         page_table,
@@ -742,7 +758,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
-        EARLY_EXIT=1 if MONO_QSA and not current_platform.is_cuda() else 0,
+        EARLY_EXIT=1 if early_exit else 0,
         num_warps=_QSA_MQA_WARPS,
         **_qsa_mqa_extra,
     )
@@ -781,6 +797,18 @@ def expand_qsa_block_indices_cuda(
         raise ValueError("QSA expansion output has an invalid shape")
     if not block_indices.shape[0]:
         return out
+    # Integer op, so the plain gate applies: the fp16 dtype restriction that
+    # guards the other QSA ops does not apply to index expansion.
+    if qsa_rdna2.qsa_use_rdna2():
+        return qsa_rdna2.qsa_expand_indices(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
     column_block = 256
     _expand_qsa_indices_kernel[
         (block_indices.shape[0], triton.cdiv(output_width, column_block))
@@ -954,12 +982,18 @@ def qsa_sparse_paged_attention(
     assert out.stride(2) == 1
     if not q.shape[0]:
         return out
-
+    # --monokernel's fused decode is HIP too and is the kernel its decode graph
+    # is built around, so an installed mono part takes the case ahead of the
+    # generic HIP kernel; a mono refusal still falls through to it.
     group_size = q.shape[1] // k_cache.shape[2]
     if MONO_QSA and MONO_QSA.sparse_decode(
         q, k_cache, v_cache, group_size, logical_indices, block_table, token_to_req, out
     ):
         return out
+    if qsa_rdna2.qsa_use_rdna2(q.dtype):
+        return qsa_rdna2.qsa_sparse_paged_attention(
+            q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        )
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
@@ -1122,7 +1156,7 @@ def qsa_compress_groups_with_ratio(
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
-    if qsa_rdna2.qsa_use_rdna2():
+    if qsa_rdna2.qsa_use_rdna2(raw_keys.dtype):
         return qsa_rdna2.qsa_compress_groups_with_ratio_compat(
             raw_keys,
             raw_positions,

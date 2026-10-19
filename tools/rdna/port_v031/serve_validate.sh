@@ -53,8 +53,12 @@ esac
 SITE=$VENV/lib/python3.12/site-packages
 export LD_LIBRARY_PATH=$SITE/_rocm_sdk_libraries/lib:$SITE/_rocm_sdk_core/lib/host-math/lib:$SITE/_rocm_sdk_core/lib/rocm_sysdeps/lib:$SITE/_rocm_sdk_core/lib/core/lib:$SITE/torch/lib
 CACHE=${CACHE:-$HOME/w4a8_runs/port-v031/cache-$TAG}
-export VLLM_CACHE_ROOT=$CACHE/vllm TRITON_CACHE_DIR=$CACHE/triton
-export TORCHINDUCTOR_CACHE_DIR=$CACHE/inductor
+# VLLM_CACHE_ROOT stays per serve (it also holds the rdna_ar wedge marker);
+# the Triton / Inductor caches may be shared by serves of one tree (keyed by
+# kernel / graph hash) to skip recompiling at boot.
+export VLLM_CACHE_ROOT=$CACHE/vllm
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$CACHE/triton}
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$CACHE/inductor}
 export ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED:-0}  # bench clients too
 
 if [[ ${STALL_PROBE:-0} == 1 && ${STALL_ITER_LOG:-1} == 1 ]]; then
