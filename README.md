@@ -1,5 +1,7 @@
 <!-- markdownlint-disable MD001 MD041 -->
 
+💬 **Join our [Discord community](https://discord.gg/n4VYYE9vAZ)** to discuss vLLM on AMD RDNA GPUs, share results, and help improve the project!
+
 > **RDNA fork (`opengfx1030/vllm-rdna`)**, default branch **`rdna_extras`**
 > (upstream v0.31.0 plus the RDNA port).
 > This is **not** stock upstream vLLM. For AMD **gfx1030 / RDNA2** (and related
