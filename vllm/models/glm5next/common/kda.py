@@ -494,6 +494,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         return True
 
+    @torch._dynamo.disable
     def forward(
         self,
         hidden_states: torch.Tensor,

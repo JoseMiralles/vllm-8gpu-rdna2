@@ -567,6 +567,8 @@ def sparse_attn_indexer_kpool(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_pool_len,
+            # The kpool cache is block-flat regardless of the model's C4A tag.
+            compress_ratio=index_kpool,
         )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
