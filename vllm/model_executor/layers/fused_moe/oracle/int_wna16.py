@@ -141,7 +141,11 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         from vllm.platforms.rocm import on_gfx10x
 
         # Native RDNA2 (gfx1030) HIP kernel, only when the op is built.
-        if (
+        import os as _os
+
+        if _os.environ.get("VLLM_RDNA2_NATIVE_MOE", "1") == "0":
+            pass
+        elif (
             on_gfx10x()
             and hasattr(torch.ops, "_rocm_C")
             and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna2")

@@ -396,7 +396,9 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
+        # gfx1030 serves fp16 (the RDNA2 W4A16 MoE kernel is fp16-only) while
+        # the upstream Hadamard-128 fp8 quant is bf16-only.
+        q_fp8, q_scale = fwht128_quant_fp8(q.to(torch.bfloat16))
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
@@ -407,7 +409,10 @@ class Indexer(nn.Module):
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        # The gate parameter and the kpool kernels are bf16; gfx1030 serves fp16.
+        gate_score = F.linear(
+            hidden_states.to(torch.bfloat16), self.index_kpool_compress_gate
+        )
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
@@ -418,6 +423,11 @@ class Indexer(nn.Module):
             pad = 32 - self.n_head
             q_fp8 = _pad_indexer_heads(q_fp8, pad)
             weights = _pad_indexer_heads(weights, pad)
+
+        # The kpool cache and its compress kernels are bf16; the model may
+        # serve fp16 on gfx1030 (RDNA2 W4A16 MoE is fp16-only).
+        k = k.to(torch.bfloat16)
+        gate_score = gate_score.to(torch.bfloat16)
 
         return self.indexer_op(
             hidden_states,

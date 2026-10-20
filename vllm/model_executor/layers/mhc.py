@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import inspect
+import os
 
 import torch
 
@@ -44,6 +45,8 @@ def _rdna_mhc_available() -> bool:
 
 def _use_rdna_mhc(residual: torch.Tensor) -> bool:
     """RDNA (no TileLang / AITER): fused HIP mHC kernels for 4 streams."""
+    if os.environ.get("VLLM_RDNA_MHC", "1") == "0":
+        return False
     return (
         residual.shape[-2] == 4
         and residual.dtype in (torch.float16, torch.bfloat16)

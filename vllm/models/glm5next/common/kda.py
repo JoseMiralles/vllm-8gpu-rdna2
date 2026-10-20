@@ -560,6 +560,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         attn_metadata_narrowed = attn_metadata_raw.get(self.prefix)
         if attn_metadata_narrowed is None:
             # Profile/warmup dummy runs may omit mamba-family metadata.
+            # Leave a defined output: an uninitialized core_attn_out reaches
+            # o_norm/o_proj as NaNs and poisons the profiling forward.
+            core_attn_out.zero_()
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         has_initial_state = attn_metadata_narrowed.has_initial_state
@@ -692,6 +695,27 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
 
+        if os.environ.get("GLM_DEBUG_KDA", "0") == "1" and "layers.0." in self.prefix:
+            torch.cuda.synchronize()
+            conv_finite = torch.isfinite(conv_state).all().item()
+            conv_norm = conv_state.float().norm().item()
+            qkv_finite = (
+                torch.isfinite(qkv_ns).all().item() if qkv_ns is not None else None
+            )
+            qkv_norm = (
+                qkv_ns.float().norm().item() if qkv_ns is not None else float("nan")
+            )
+            print(
+                f"DBG kda dev={torch.cuda.current_device()} "
+                f"has_init="
+                f"{has_initial_state.tolist() if has_initial_state is not None else None} "
+                f"idx="
+                f"{non_spec_state_indices_tensor[:4].tolist() if non_spec_state_indices_tensor is not None else None} "
+                f"conv_norm={conv_norm:.4f} fin={conv_finite} "
+                f"qkv_norm={qkv_norm:.4f} fin={qkv_finite}",
+                flush=True,
+            )
+
         def _rearr(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
 
@@ -745,6 +769,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             initial_state = gather_initial_states(
                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
             )
+            if os.environ.get("GLM_DEBUG_KDA", "0") == "1" and "layers.0." in self.prefix:
+                torch.cuda.synchronize()
+                print(
+                    f"DBG kda_init dev={torch.cuda.current_device()} "
+                    f"init_norm={initial_state.float().norm().item():.4f} "
+                    f"fin={torch.isfinite(initial_state).all().item()}",
+                    flush=True,
+                )
             if self.kda_prefill_backend == "flashkda":
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
