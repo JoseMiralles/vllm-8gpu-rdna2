@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -26,6 +27,14 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
+
+
+def _dbg_mtp_stage(msg: str) -> None:
+    if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") != "1":
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"DBG MTP dev={torch.cuda.current_device()} {msg}", flush=True)
 
 # Read once at import: Dynamo-traced hot paths must not re-evaluate the gate.
 _ON_RDNA2 = on_rdna2_hip()
@@ -248,6 +257,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
+        _dbg_mtp_stage("propose_start")
         if phase_timer is not None:
             phase_timer.mark("dstart")
         self._copy_request_inputs(
@@ -259,6 +269,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Get the input ids and last token indices for the speculator.
+        # The draft input buffers can alias the target input buffers; copy the
+        # target fields first so the preparation kernel does not read values it
+        # is concurrently overwriting.
+        input_batch.input_ids = input_batch.input_ids.clone()
+        input_batch.positions = input_batch.positions.clone()
+        input_batch.query_start_loc = input_batch.query_start_loc.clone()
+        input_batch.seq_lens = input_batch.seq_lens.clone()
         prepare_prefill_inputs(
             self.last_token_indices,
             self.current_draft_step,
@@ -271,6 +288,23 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.max_num_reqs,
         )
 
+        _dbg_mtp_stage("prefill_inputs_done")
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1" and num_tokens <= 32:
+            torch.cuda.synchronize()
+            print(
+                f"DBG spec_inputs dev={torch.cuda.current_device()} "
+                f"num_reqs={num_reqs} num_tokens={num_tokens} "
+                f"last_idx={self.last_token_indices[:num_reqs].tolist()} "
+                f"ids={self.input_buffers.input_ids[:num_tokens].tolist()} "
+                f"pos={self.input_buffers.positions[:num_tokens].tolist()} "
+                f"qsl={input_batch.query_start_loc[: num_reqs + 1].tolist()} "
+                f"seq={input_batch.seq_lens[:num_reqs].tolist()} "
+                f"num_sampled={num_sampled[:num_reqs].tolist()} "
+                f"num_rejected={num_rejected[:num_reqs].tolist()} "
+                f"last_sampled={last_sampled[:num_reqs].tolist()} "
+                f"next_prefill={next_prefill_tokens[:num_reqs].tolist()}",
+                flush=True,
+            )
         if self.pcp_manager is not None:
             self.pcp_manager.prepare_draft_prefill(
                 input_batch, self.input_buffers.input_ids[:num_tokens_padded]
@@ -310,6 +344,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_tokens)
 
         self.on_prefill_begin(num_reqs)
+        _dbg_mtp_stage("mtp_prefill_start")
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
@@ -327,12 +362,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
             )
+        _dbg_mtp_stage("mtp_prefill_done")
         self.on_prefill_end(num_reqs)
         if phase_timer is not None:
             phase_timer.mark(f"dprefill_{prefill_batch_desc.cg_mode.name}")
 
         if self.num_speculative_steps == 1:
             # Early exit.
+            _dbg_mtp_stage("propose_done")
             return self.draft_tokens[:num_reqs, :1]
 
         if self.pcp_manager is not None and not dummy_run:
@@ -392,6 +429,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens_cpu_upper_bound,
         )
         self.on_multi_step_decode_end(num_reqs)
+        _dbg_mtp_stage("propose_done")
 
         return self.draft_tokens[:num_reqs]
 
@@ -421,6 +459,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             batch_descriptor=batch_descriptor,
             is_padding=is_padding,
         ):
+            _dbg_mtp_stage("mtp_run_model_enter")
             inputs_embeds = None
             if self.supports_mm_inputs:
                 assert self.inputs_embeds is not None
@@ -451,7 +490,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 )
             else:
                 # Eager (NONE): call the raw model directly.
+                _dbg_mtp_stage("mtp_model_call")
                 ret_hidden_states = self.model(**model_inputs)
+                _dbg_mtp_stage("mtp_model_return")
         # Some MTP models declare a single-tensor contract but return
         # (logits_hidden, feedback_hidden) for final-norm correctness.
         if isinstance(ret_hidden_states, tuple):
@@ -798,7 +839,11 @@ def prepare_prefill_inputs(
     max_num_reqs,
 ) -> torch.Tensor:
     num_reqs = input_batch.num_reqs
-    if _ON_RDNA2 and num_reqs > 0:
+    if (
+        _ON_RDNA2
+        and num_reqs > 0
+        and os.environ.get("VLLM_RDNA_SPEC_PREPARE_HIP", "1") == "1"
+    ):
         assert input_batch.num_reqs == num_reqs
         torch.ops._rocm_C.spec_prepare_prefill_inputs_rdna2(
             last_token_indices,

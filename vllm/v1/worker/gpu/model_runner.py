@@ -1720,6 +1720,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_last_pp_rank:
             assert self.sampler is not None
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
+
+        # RDNA2 repair: the target model's forward pass (mHC/hc_expand at
+        # layer 0) writes OOB, corrupting persistent GPU buffers including
+        # total_len and num_computed_tokens. Re-initialize them from the
+        # CPU-side state (main memory, immune to GPU OOB writes) before the
+        # post_update kernel reads them. Without this, garbage total_len
+        # values cause massively OOB writes in post_update, hanging the GPU.
+        if os.environ.get("GLM_REPAIR_STATE", "1") == "1":
+            for i in range(min(idx_mapping.shape[0], 8)):
+                req_idx = int(idx_mapping[i].item())
+                if 0 <= req_idx < self.req_states.num_computed_tokens_np.shape[0]:
+                    nct = int(self.req_states.num_computed_tokens_np[req_idx])
+                    self.req_states.total_len.gpu[req_idx] = nct
+                    self.req_states.num_computed_tokens.gpu[req_idx] = nct
+
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            _ns = num_sampled.tolist() if isinstance(num_sampled, torch.Tensor) else num_sampled
+            _nr = num_rejected.tolist() if isinstance(num_rejected, torch.Tensor) else num_rejected
+            _im = idx_mapping.tolist() if isinstance(idx_mapping, torch.Tensor) else idx_mapping
+            _st = sampled_tokens.tolist()[:4] if isinstance(sampled_tokens, torch.Tensor) else str(sampled_tokens)[:50]
+            _tl = self.req_states.total_len.gpu[:4].tolist()
+            _qsl = query_start_loc.tolist()[:4] if isinstance(query_start_loc, torch.Tensor) else query_start_loc
+            _nct = self.req_states.num_computed_tokens.gpu[:4].tolist()
+            print(
+                f"DBG canary stage=pre_post_update dev={torch.cuda.current_device()} "
+                f"ns={_ns} nr={_nr} idx_map={_im} sampled={_st} "
+                f"total_len={_tl} qsl={_qsl} nct={_nct} "
+                f"all_ids_shape={tuple(self.req_states.all_token_ids.gpu.shape)} "
+                f"all_ids_stride={self.req_states.all_token_ids.gpu.stride(0)} "
+                f"bins_shape={tuple(output_bin_counts.shape) if output_bin_counts is not None else None} "
+                f"bins_stride={output_bin_counts.stride(0) if output_bin_counts is not None else None}",
+                flush=True,
+            )
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1732,6 +1766,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
         )
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            print(
+                f"DBG canary stage=after_post_update dev={torch.cuda.current_device()}",
+                flush=True,
+            )
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
@@ -2001,6 +2041,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 
+        if os.environ.get("GLM_DEBUG_QSL_CANARY", "0") == "1":
+            # The target forward can overwrite the persistent input buffers
+            # (observed for query_start_loc at layer 0). Snapshot the fields
+            # consumed by the MTP draft before the target runs.
+            input_batch.input_ids = input_batch.input_ids.clone()
+            input_batch.positions = input_batch.positions.clone()
+            input_batch.query_start_loc = input_batch.query_start_loc.clone()
+            input_batch.seq_lens = input_batch.seq_lens.clone()
+            input_ids = input_batch.input_ids
+            print(
+                f"DBG INPUT_SNAPSHOT dev={torch.cuda.current_device()} "
+                f"ids_ptr={input_ids.data_ptr()} "
+                f"pos_ptr={input_batch.positions.data_ptr()} "
+                f"qsl_ptr={input_batch.query_start_loc.data_ptr()} "
+                f"seq_ptr={input_batch.seq_lens.data_ptr()}",
+                flush=True,
+            )
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
@@ -2010,6 +2067,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        if os.environ.get("GLM_DEBUG_QSL_CANARY", "0") == "1":
+            from vllm.models.glm5next.common.model import set_qsl_canary
+
+            torch.cuda.synchronize()
+            print(
+                f"DBG QSL_CANARY_SET dev={torch.cuda.current_device()} "
+                f"qsl={input_batch.query_start_loc.tolist()}",
+                flush=True,
+            )
+            _qsl_orig = input_batch.query_start_loc
+            _qsl_safe = _qsl_orig.clone()
+            input_batch.query_start_loc = _qsl_safe
+            print(
+                f"DBG QSL_SAFE dev={torch.cuda.current_device()} "
+                f"orig={_qsl_orig.data_ptr()} safe={_qsl_safe.data_ptr()}",
+                flush=True,
+            )
+            set_qsl_canary(_qsl_safe)
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -2188,6 +2263,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         self.execute_model_state = None
 
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            n = min(input_batch.num_tokens, 8)
+            print(
+                f"DBG canary stage=after_target dev={torch.cuda.current_device()} "
+                f"qsl={input_batch.query_start_loc.tolist()} "
+                f"seq={input_batch.seq_lens.tolist()} "
+                f"ids={input_batch.input_ids[:n].tolist()} "
+                f"pos={input_batch.positions[:n].tolist()}",
+                flush=True,
+            )
+
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
@@ -2219,6 +2306,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            print(
+                f"DBG canary stage=after_sample dev={torch.cuda.current_device()}",
+                flush=True,
+            )
         if phase_timer is not None:
             phase_timer.mark("sample")
 
@@ -2274,6 +2367,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
         )
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            print(
+                f"DBG canary stage=after_async_output dev={torch.cuda.current_device()}",
+                flush=True,
+            )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         # The encoder runner exists only on the first PP rank, so later ranks
@@ -2305,6 +2404,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            print(
+                f"DBG canary stage=after_postprocess dev={torch.cuda.current_device()}",
+                flush=True,
+            )
+
+        if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") == "1":
+            torch.cuda.synchronize()
+            n = min(input_batch.num_tokens, 8)
+            print(
+                f"DBG canary stage=pre_propose dev={torch.cuda.current_device()} "
+                f"qsl={input_batch.query_start_loc.tolist()} "
+                f"seq={input_batch.seq_lens.tolist()} "
+                f"ids={input_batch.input_ids[:n].tolist()} "
+                f"pos={input_batch.positions[:n].tolist()}",
+                flush=True,
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None

@@ -97,6 +97,49 @@ from .multimodal import (
 
 logger = init_logger(__name__)
 
+
+def _dbg_mtp_stage(msg: str) -> None:
+    if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") != "1":
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"DBG MTP dev={torch.cuda.current_device()} {msg}", flush=True)
+
+
+_QSL_CANARY_SRC = None
+_QSL_CANARY_REF = None
+
+
+def set_qsl_canary(src: torch.Tensor) -> None:
+    global _QSL_CANARY_SRC, _QSL_CANARY_REF
+    if os.environ.get("GLM_DEBUG_QSL_CANARY", "0") != "1":
+        return
+    _QSL_CANARY_SRC = src
+    _QSL_CANARY_REF = src.clone()
+    torch.cuda.synchronize()
+    print(
+        f"DBG QSL_OWNER dev={torch.cuda.current_device()} "
+        f"ptr={src.data_ptr()} base={src.untyped_storage().data_ptr()} "
+        f"bytes={src.untyped_storage().nbytes()} shape={tuple(src.shape)} "
+        f"stride={src.stride()} contig={src.is_contiguous()} "
+        f"base_tensor={src._base is not None}",
+        flush=True,
+    )
+
+
+def _check_qsl_canary(tag: str) -> None:
+    if _QSL_CANARY_SRC is None or os.environ.get("GLM_DEBUG_QSL_CANARY", "0") != "1":
+        return
+    torch.cuda.synchronize()
+    if not torch.equal(_QSL_CANARY_SRC, _QSL_CANARY_REF):
+        print(
+            f"DBG QSL_CANARY_CHANGED dev={torch.cuda.current_device()} tag={tag} "
+            f"before={_QSL_CANARY_REF.tolist()} "
+            f"after={_QSL_CANARY_SRC.tolist()}",
+            flush=True,
+        )
+        raise RuntimeError(f"query_start_loc canary changed at {tag}")
+
 _AUDIT_SAMPLE_SUFFIXES = (
     "embed_tokens.weight",
     "lm_head.weight",
@@ -652,6 +695,11 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # 70B or MTP layers: KDA + MoE without HC.
         if not self.mhc or self.is_mtp_layer:
+            dbg_small = positions.shape[0] <= 32
+            if self.is_mtp_layer:
+                _dbg_mtp_stage(f"mtp_decoder_start layer={self.layer_idx}")
+            elif dbg_small:
+                _dbg_mtp_stage(f"target_layer_start layer={self.layer_idx}")
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
@@ -659,10 +707,18 @@ class Glm5NextDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 positions=positions,
             )
+            if self.is_mtp_layer:
+                _dbg_mtp_stage(f"mtp_decoder_attn_done layer={self.layer_idx}")
+            elif dbg_small:
+                _dbg_mtp_stage(f"target_layer_attn_done layer={self.layer_idx}")
             hidden_states, residual = self.post_attention_layernorm(
                 attn_output, residual=residual
             )
             hidden_states = self.mlp(hidden_states)
+            if self.is_mtp_layer:
+                _dbg_mtp_stage(f"mtp_decoder_mlp_done layer={self.layer_idx}")
+            elif dbg_small:
+                _dbg_mtp_stage(f"target_layer_mlp_done layer={self.layer_idx}")
             if self.is_mtp_layer:
                 # Return the unsummed pair: the MTP caller feeds it straight
                 # into shared_head's fused_add_rms_norm (one kernel instead of
@@ -676,10 +732,49 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post inputs (its ffn-pre outputs); when present, fuse that
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
+        dbg_small = positions.shape[0] <= 32
+        if self.layer_idx == 0:
+            _check_qsl_canary("layer0_enter")
+        if dbg_small:
+            _dbg_mtp_stage(f"target_layer_start layer={self.layer_idx}")
         x = hidden_states
         if post is None:
             if self.layer_idx == 0:
-                x = hc_expand(x, self.n)
+                _xps = x.data_ptr()
+                _xbase = x.untyped_storage().data_ptr()
+                _xbytes = x.untyped_storage().nbytes()
+                _xv = x.unsqueeze(1).expand(-1, self.n, -1)
+                _check_qsl_canary("layer0_hc_view")
+                _x = _xv.clone()
+                _check_qsl_canary("layer0_hc_contig")
+                _obase = _x.untyped_storage().data_ptr()
+                _obytes = _x.untyped_storage().nbytes()
+                _qbase = (
+                    _QSL_CANARY_SRC.untyped_storage().data_ptr()
+                    if _QSL_CANARY_SRC is not None
+                    else -1
+                )
+                _qbytes = (
+                    _QSL_CANARY_SRC.untyped_storage().nbytes()
+                    if _QSL_CANARY_SRC is not None
+                    else 0
+                )
+                _overlap = not (
+                    _obase + _obytes <= _qbase or _qbase + _qbytes <= _obase
+                )
+                print(
+                    f"DBG HC_EXPAND dev={torch.cuda.current_device()} n={self.n} "
+                    f"x_ptr={_xps} x_base={_xbase} x_bytes={_xbytes} "
+                    f"x_shape={tuple(x.shape)} x_stride={x.stride()} "
+                    f"out_shape={tuple(_x.shape)} out_base={_obase} "
+                    f"out_bytes={_obytes} qsl_base={_qbase} qsl_bytes={_qbytes} "
+                    f"overlap={_overlap} "
+                    f"x_hdr={x.view(torch.int32).flatten()[:2].tolist()} "
+                    f"qsl_hdr={_QSL_CANARY_SRC.view(torch.int32).flatten()[:2].tolist() if _QSL_CANARY_SRC is not None else []}",
+                    flush=True,
+                )
+                x = _x
+                _check_qsl_canary("layer0_hc_expand")
             residual = x
             post, comb, x = self.hc_pre(
                 x,
@@ -689,6 +784,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_weight=self.input_layernorm.weight.data,
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
+            if self.layer_idx == 0:
+                _check_qsl_canary("layer0_hc_pre")
         else:
             residual, post, comb, x = self.hc_fused_post_pre(
                 x,
@@ -702,16 +799,27 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
 
+        if self.layer_idx == 0:
+            _check_qsl_canary("layer0_hc")
+
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        if self.layer_idx == 0:
+            _check_qsl_canary("layer0_gather")
+        if dbg_small:
+            _dbg_mtp_stage(f"target_layer_prep_done layer={self.layer_idx}")
         self._dbg_layer0("pre", x=x, post=post, comb=comb)
         x = self.self_attn(
             hidden_states=x,
             positions=positions,
         )
+        if self.layer_idx == 0:
+            _check_qsl_canary("layer0_attn")
+        if dbg_small:
+            _dbg_mtp_stage(f"target_layer_attn_done layer={self.layer_idx}")
         self._dbg_layer0("attn", x=x)
 
         if self.is_sequence_parallel:
@@ -736,6 +844,10 @@ class Glm5NextDecoderLayer(nn.Module):
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+        if dbg_small:
+            _dbg_mtp_stage(f"target_layer_mlp_done layer={self.layer_idx}")
+        if self.layer_idx == 0:
+            _check_qsl_canary("layer0_mlp")
         self._dbg_layer0("mlp", x=x)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
@@ -925,6 +1037,7 @@ class Glm5NextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        _dbg_mtp_stage(f"target_forward_start tokens={positions.shape[0]}")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -970,6 +1083,7 @@ class Glm5NextModel(nn.Module):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            _check_qsl_canary(f"layer={self.start_layer + layer_idx}")
             if os.environ.get("GLM_DEBUG_NAN", "0") == "1":
                 torch.cuda.synchronize()
                 h_norm = hidden_states.float().norm().item()
@@ -1002,6 +1116,7 @@ class Glm5NextModel(nn.Module):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        _dbg_mtp_stage(f"target_forward_done tokens={positions.shape[0]}")
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1352,7 +1467,9 @@ class Glm5NextForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        _dbg_mtp_stage(f"target_logits_start tokens={hidden_states.shape[0]}")
         logits = self.logits_processor(self.lm_head, hidden_states)
+        _dbg_mtp_stage("target_logits_done")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

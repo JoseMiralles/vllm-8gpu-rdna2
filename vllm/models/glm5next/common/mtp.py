@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -34,6 +35,14 @@ from .model import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+
+
+def _dbg_mtp_stage(msg: str) -> None:
+    if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") != "1":
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"DBG MTP dev={torch.cuda.current_device()} {msg}", flush=True)
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -92,6 +101,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
     ) -> torch.Tensor:
         assert inputs_embeds is not None
         # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
+        _dbg_mtp_stage(f"mtp_layer_start tokens={positions.shape[0]}")
         eh_input = fused_eh_norm(
             positions,
             inputs_embeds,
@@ -101,13 +111,17 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
         )
         hidden_states = self.eh_proj(eh_input)
+        _dbg_mtp_stage("mtp_layer_eh_done")
         # Fuse the residual add and final RMSNorm. Glm5NextMoE already performs
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
         hidden_states, residual, _, _ = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
+        _dbg_mtp_stage("mtp_layer_block_done")
+        _dbg_mtp_stage(f"mtp_pre_norm hs_shape={tuple(hidden_states.shape)} hs_norm={hidden_states.float().norm().item():.2f} res_norm={residual.float().norm().item():.2f}")
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
+        _dbg_mtp_stage(f"mtp_post_norm hs_shape={tuple(hidden_states.shape)} hs_norm={hidden_states.float().norm().item():.2f}")
         return hidden_states, hidden_states
 
 
@@ -167,8 +181,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        _dbg_mtp_stage("mtp_predictor_enter")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        _dbg_mtp_stage("mtp_embed_done")
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self._mtp_layers[current_step_idx](
             input_ids,
@@ -185,10 +201,13 @@ class Glm5NextMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self._mtp_layers[current_step_idx]
+        _dbg_mtp_stage(f"mtp_compute_logits_enter hs_shape={tuple(hidden_states.shape)} hs_norm={hidden_states.float().norm().item():.2f}")
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
         # second RMSNorm.
-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        result = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        _dbg_mtp_stage(f"mtp_compute_logits_done logits={'None' if result is None else tuple(result.shape)}")
+        return result
 
     def get_top_tokens(
         self,

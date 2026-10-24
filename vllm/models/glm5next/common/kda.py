@@ -170,6 +170,14 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
+def _dbg_mtp_stage(msg: str) -> None:
+    if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") != "1":
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"DBG MTP dev={torch.cuda.current_device()} {msg}", flush=True)
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
@@ -501,8 +509,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
+        dbg_small = num_tokens <= 32
+        if dbg_small:
+            if os.environ.get("GLM_DEBUG_KDA", "0") == "1":
+                torch.cuda.synchronize()
+                print(
+                    f"DBG kda_in dev={torch.cuda.current_device()} "
+                    f"prefix={self.prefix} "
+                    f"norm={hidden_states.float().norm().item():.4f} "
+                    f"fin={torch.isfinite(hidden_states).all().item()}",
+                    flush=True,
+                )
+            _dbg_mtp_stage(
+                f"kda_fwd_enter prefix={self.prefix} tokens={num_tokens}"
+            )
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        if dbg_small:
+            _dbg_mtp_stage("kda_fwd_inproj_done")
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,
@@ -525,6 +549,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g_proj_states = self.g_b_proj(g_a)[0]
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+        if dbg_small:
+            _dbg_mtp_stage("kda_fwd_gproj_done")
 
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
@@ -533,15 +559,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         # Call the decorated eager break directly so host-side prefill branches
         # are not captured by PIECEWISE CUDA graphs.
+        if dbg_small:
+            _dbg_mtp_stage("kda_fwd_core_start")
         self._forward(
             qkv_proj_states=qkv,
             g1=g1,
             beta=beta,
             core_attn_out=core_attn_out,
         )
+        if dbg_small:
+            _dbg_mtp_stage("kda_fwd_core_done")
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        out = self.o_proj(core_attn_out)[0]
+        if dbg_small:
+            _dbg_mtp_stage("kda_fwd_done")
+        return out
 
     @eager_break_during_capture
     def _forward(
@@ -572,6 +605,37 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             attn_metadata_narrowed.non_spec_state_indices_tensor
         )  # noqa: E501
         num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
+
+        # MTP can leave the KDA prefill metadata's query_start_loc buffer with
+        # stale/overwritten values after the first layer. A single-prefill
+        # batch has an unambiguous [0, num_actual_tokens] range, so repair the
+        # range before any conv/recurrent kernel consumes it.
+        if (
+            attn_metadata_narrowed.num_prefills == 1
+            and attn_metadata_narrowed.num_decodes == 0
+            and num_actual_tokens > 0
+        ):
+            qsl_valid = False
+            if non_spec_query_start_loc is not None:
+                qsl = non_spec_query_start_loc.tolist()
+                qsl_valid = (
+                    len(qsl) == 2
+                    and qsl[0] == 0
+                    and qsl[1] == num_actual_tokens
+                )
+            if not qsl_valid:
+                non_spec_query_start_loc = torch.tensor(
+                    [0, num_actual_tokens],
+                    dtype=torch.int32,
+                    device=qkv_proj_states.device,
+                )
+                if num_actual_tokens <= 32:
+                    print(
+                        f"DBG kda_qsl_repaired dev={torch.cuda.current_device()} "
+                        f"prefix={self.prefix} tokens={num_actual_tokens}",
+                        flush=True,
+                    )
+
         # Spec-decode metadata (all None when speculative decoding is disabled).
         spec_sequence_masks = attn_metadata_narrowed.spec_sequence_masks
         spec_query_start_loc = attn_metadata_narrowed.spec_query_start_loc
@@ -581,6 +645,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
         use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
+        dbg = num_actual_tokens <= 32
+        dbg_prefill = dbg
+        if dbg:
+            _dbg_mtp_stage(
+                f"kda_core_enter prefix={self.prefix} tokens={num_actual_tokens} "
+                f"spec={use_spec} prefill={attn_metadata_narrowed.num_prefills}"
+            )
+        if use_spec and dbg:
+            _dbg_mtp_stage(f"kda_spec_start tokens={num_actual_tokens}")
         # Safe-gate checkpoints use the bounded sigmoid variant.
         safe_gate = self.kda_safe_gate
         lower_bound = self.kda_lower_bound
@@ -596,6 +669,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Layout is process-global and resolved once at init (see __init__).
         if not self._conv_state_dim_first:
             conv_state = conv_state.transpose(-1, -2)
+
+        if dbg_prefill and non_spec_query_start_loc is not None:
+            torch.cuda.synchronize()
+            print(
+                f"DBG kda_meta dev={torch.cuda.current_device()} "
+                f"prefix={self.prefix} "
+                f"qsl={non_spec_query_start_loc.tolist()} "
+                f"has_init={has_initial_state.tolist() if has_initial_state is not None else None} "
+                f"idx={non_spec_state_indices_tensor[:4].tolist()} "
+                f"conv_shape={tuple(conv_state.shape)} "
+                f"conv_strides={tuple(conv_state.stride())}",
+                flush=True,
+            )
 
         # One merged short-conv over q|k|v instead of three separate calls. The
         # 1D conv is independent per channel, so concatenating q/k/v along the
@@ -663,24 +749,51 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc,
                 max_query_len=conv_mql,
             )
+            if dbg:
+                _dbg_mtp_stage("kda_spec_conv_done")
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         q_ns = k_ns = v_ns = None
         if attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
-            qkv_ns = causal_conv1d_fn(
-                qkv_ns.transpose(0, 1),
-                conv_weights,
-                conv_bias,
-                activation="silu",
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+            if dbg_prefill:
+                x_conv = qkv_ns.transpose(0, 1)
+                print(
+                    f"DBG kda_conv_args dev={torch.cuda.current_device()} "
+                    f"x_dtype={x_conv.dtype} x_shape={tuple(x_conv.shape)} "
+                    f"x_stride={tuple(x_conv.stride())} "
+                    f"w_dtype={conv_weights.dtype} "
+                    f"st_dtype={conv_state.dtype} "
+                    f"st_shape={tuple(conv_state.shape)} "
+                    f"st_stride={tuple(conv_state.stride())}",
+                    flush=True,
+                )
+                _dbg_mtp_stage(f"kda_prefill_conv_start tokens={num_actual_tokens}")
+            if (
+                os.environ.get("GLM_DEBUG_KDA_SKIP_CONV", "0") == "1"
+                and ".layers.1." in self.prefix
+            ):
+                q_ns, k_ns, v_ns = qkv_ns.split(
+                    self.local_projection_size, dim=-1
+                )
+                if dbg_prefill:
+                    _dbg_mtp_stage("kda_prefill_conv_skipped")
+            else:
+                qkv_ns = causal_conv1d_fn(
+                    qkv_ns.transpose(0, 1),
+                    conv_weights,
+                    conv_bias,
+                    activation="silu",
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    metadata=attn_metadata_narrowed,
+                ).transpose(0, 1)
+                q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+                if dbg_prefill:
+                    _dbg_mtp_stage("kda_prefill_conv_done")
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
@@ -696,7 +809,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
 
-        if os.environ.get("GLM_DEBUG_KDA", "0") == "1" and "layers.0." in self.prefix:
+        if os.environ.get("GLM_DEBUG_KDA", "0") == "1" and dbg_prefill:
             torch.cuda.synchronize()
             conv_finite = torch.isfinite(conv_state).all().item()
             conv_norm = conv_state.float().norm().item()
@@ -738,6 +851,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
             # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit and
             # skips its launch + fp32 [n, H, D] intermediate per layer.
+            if dbg:
+                _dbg_mtp_stage("kda_spec_recurrent_start")
             core_attn_out_spec, _ = fused_recurrent_kda(
                 q=_rearr(q_spec),
                 k=_rearr(k_spec),
@@ -756,6 +871,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 compute_gate=True,
                 lower_bound=lower_bound,
             )
+            if dbg:
+                _dbg_mtp_stage("kda_spec_recurrent_done")
 
         # --- core attention: non-spec path (prefill or plain decode) ---
         core_attn_out_non_spec = None
@@ -770,7 +887,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             initial_state = gather_initial_states(
                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
             )
-            if os.environ.get("GLM_DEBUG_KDA", "0") == "1" and "layers.0." in self.prefix:
+            if os.environ.get("GLM_DEBUG_KDA", "0") == "1" and dbg_prefill:
                 torch.cuda.synchronize()
                 print(
                     f"DBG kda_init dev={torch.cuda.current_device()} "
@@ -778,6 +895,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     f"fin={torch.isfinite(initial_state).all().item()}",
                     flush=True,
                 )
+            if dbg_prefill:
+                _dbg_mtp_stage("kda_prefill_recurrent_start")
             if self.kda_prefill_backend == "flashkda":
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
@@ -814,6 +933,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     safe_gate=safe_gate,
                     lower_bound=lower_bound,
                 )
+            if dbg_prefill:
+                _dbg_mtp_stage("kda_prefill_recurrent_done")
             # Init cache
             scatter_states(
                 recurrent_state,

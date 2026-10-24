@@ -10,12 +10,16 @@ import torch
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm._aiter_ops import is_aiter_found_and_supported
+from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
 
+logger = init_logger(__name__)
 _COMPILED_MHC_TORCH: dict[str, object] = {}
+_MHC_MTP_GUARD_WARNED = False
 
 
 def _maybe_compile_mhc_torch(fn, *args, **kwargs):
@@ -96,7 +100,22 @@ def _use_rdna_mhc(residual: torch.Tensor) -> bool:
     ``1`` enables every small batch, including MTP verify; that path hung the
     GPU on 2026-10-20 and is not safe until the zero-row guard lands.
     """
+    global _MHC_MTP_GUARD_WARNED
     mode = os.environ.get("VLLM_RDNA_MHC", "0")
+    if mode == "1":
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            vllm_config is not None
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.num_speculative_tokens > 0
+        ):
+            if not _MHC_MTP_GUARD_WARNED:
+                logger.warning(
+                    "VLLM_RDNA_MHC=1 is unsafe with speculative decoding; "
+                    "forcing the decode-only 't1' mode (reference mHC for T>1)."
+                )
+                _MHC_MTP_GUARD_WARNED = True
+            mode = "t1"
     if mode == "1":
         pass
     elif mode == "t1" and residual.shape[0] == 1:

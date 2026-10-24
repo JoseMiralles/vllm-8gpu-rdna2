@@ -715,23 +715,12 @@ def post_update(
     total_len: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
-    if _ON_RDNA2:
-        torch.ops._rocm_C.post_update_rdna2(
-            idx_mapping,
-            num_computed_tokens,
-            last_sampled_tokens,
-            output_bin_counts,
-            output_bin_counts.stride(0) if output_bin_counts is not None else 0,
-            sampled_tokens,
-            sampled_tokens.stride(0),
-            num_sampled,
-            num_rejected,
-            query_start_loc,
-            all_token_ids,
-            all_token_ids.stride(0),
-            total_len,
-        )
-        return
+    # Bypass the pre-compiled HIP kernel on RDNA2: it hangs in the MTP
+    # speculative decoding path even with valid inputs (num_sampled=[1]).
+    # The Triton fallback below is functionally identical.
+    # if _ON_RDNA2:
+    #     torch.ops._rocm_C.post_update_rdna2(...)
+    #     return
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,

@@ -726,6 +726,18 @@ def causal_conv1d_fn(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    if os.environ.get("GLM_DEBUG_KDA", "0") == "1":
+        print(
+            f"DBG conv_dispatch on_rdna2={on_rdna2()} "
+            f"x={x.dtype} st={conv_states.dtype} w={weight.dtype} "
+            f"chan={is_channel_last} dim32={dim % 32 == 0} ww={width} "
+            f"state_ok={_hip_conv_state_ok(conv_states, width)} "
+            f"idx={cache_indices is not None} "
+            f"last={block_idx_last_scheduled_token is None} "
+            f"op={hasattr(torch.ops, '_rocm_C') and hasattr(torch.ops._rocm_C, 'causal_conv1d_fwd_rdna2')} "
+            f"env={os.environ.get('VLLM_CAUSAL_CONV1D_RDNA2_FWD', '1')}",
+            flush=True,
+        )
     if batch_ptr.device != x.device:
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)

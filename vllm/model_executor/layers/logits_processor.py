@@ -187,7 +187,23 @@ class LogitsProcessor(PluggableLayer):
         skip_gather: bool = False,
     ) -> torch.Tensor | None:
         # Get the logits for the next tokens.
+        _dbg_lp = os.environ.get("GLM_DEBUG_LOGITS", "0") == "1"
+        if _dbg_lp:
+            torch.cuda.synchronize()
+            print(
+                f"DBG lp_pre_head dev={torch.cuda.current_device()} "
+                f"hidden={tuple(hidden_states.shape)} "
+                f"use_all_gather={self.use_all_gather} tp={lm_head.tp_size}",
+                flush=True,
+            )
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if _dbg_lp:
+            torch.cuda.synchronize()
+            print(
+                f"DBG lp_head_done dev={torch.cuda.current_device()} "
+                f"logits={tuple(logits.shape)}",
+                flush=True,
+            )
         if os.environ.get("GLM_DEBUG_LOGITS", "0") == "1":
             torch.cuda.synchronize()
             ref = F.linear(hidden_states, lm_head.weight)
@@ -208,6 +224,13 @@ class LogitsProcessor(PluggableLayer):
         # Gather logits for TP
         if lm_head.tp_size > 1:
             logits = self._gather_logits(logits)
+            if _dbg_lp:
+                torch.cuda.synchronize()
+                print(
+                    f"DBG lp_gather_done dev={torch.cuda.current_device()} "
+                    f"logits={None if logits is None else tuple(logits.shape)}",
+                    flush=True,
+                )
             if phase_timer is not None:
                 phase_timer.mark("gather")
 

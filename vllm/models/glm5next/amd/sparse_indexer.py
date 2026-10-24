@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -36,6 +38,14 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+def _dbg_indexer_stage(msg: str) -> None:
+    if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") != "1":
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"DBG IDX dev={torch.cuda.current_device()} {msg}", flush=True)
 
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
@@ -166,6 +176,12 @@ def sparse_attn_indexer_kpool(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+    dbg_small = hidden_states.shape[0] <= 32
+    if dbg_small:
+        _dbg_indexer_stage(
+            f"start tokens={hidden_states.shape[0]} "
+            f"prefill={has_prefill} decode={has_decode} kpool={index_kpool}"
+        )
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -204,6 +220,8 @@ def sparse_attn_indexer_kpool(
                     head_dim,
                     round_scale=(scale_fmt is not None),
                 )
+                if dbg_small:
+                    _dbg_indexer_stage("kpool_insert_done")
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
                 # ``pos % kpool`` within the request's tail block. Processing
@@ -221,6 +239,8 @@ def sparse_attn_indexer_kpool(
                             index_kpool,
                             head_dim,
                         )
+                        if dbg_small:
+                            _dbg_indexer_stage("tail_seed_done")
         else:
             # standard: per-token fp8 quant + scatter (all tokens).
             assert scale_fmt is not None
@@ -270,6 +290,8 @@ def sparse_attn_indexer_kpool(
             _pos = positions[num_decode_tokens:num_tokens].to(torch.int32)
             _buf = topk_indices_buffer[num_decode_tokens:num_tokens]
             _fill_causal_indices(_buf, _pos)
+            if dbg_small:
+                _dbg_indexer_stage("short_prefill_fill_done")
 
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
@@ -329,6 +351,8 @@ def sparse_attn_indexer_kpool(
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
+            if dbg_small:
+                _dbg_indexer_stage("logits_done")
             num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
@@ -355,6 +379,8 @@ def sparse_attn_indexer_kpool(
                 logits.stride(1),
                 select_k,
             )
+            if dbg_small:
+                _dbg_indexer_stage("topk_done")
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -377,7 +403,11 @@ def sparse_attn_indexer_kpool(
                 topk_indices_buffer[
                     chunk.token_start : chunk.token_end, : expanded.shape[-1]
                 ] = expanded
+                if dbg_small:
+                    _dbg_indexer_stage("expand_done")
 
+    if dbg_small:
+        _dbg_indexer_stage(f"prefill_done short={has_prefill and short_prefill}")
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
@@ -510,6 +540,8 @@ def sparse_attn_indexer_kpool(
             attn_metadata_narrowed.max_seq_len,
             topk_tokens,
         ):
+            if dbg_small:
+                _dbg_indexer_stage("short_decode_fill_done")
             return topk_indices_buffer
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -624,6 +656,8 @@ def sparse_attn_indexer_kpool(
             )
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
+    if dbg_small:
+        _dbg_indexer_stage("done")
     return topk_indices_buffer
 
 

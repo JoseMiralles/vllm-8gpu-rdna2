@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -41,6 +43,14 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
+
+
+def _dbg_attn_stage(msg: str) -> None:
+    if os.environ.get("GLM_DEBUG_MTP_STAGE", "0") != "1":
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"DBG ATTN dev={torch.cuda.current_device()} {msg}", flush=True)
 
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
@@ -346,6 +356,9 @@ class Indexer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
+        dbg_small = positions.shape[0] <= 32
+        if dbg_small:
+            _dbg_attn_stage(f"indexer_start tokens={positions.shape[0]}")
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
@@ -429,7 +442,9 @@ class Indexer(nn.Module):
         k = k.to(torch.bfloat16)
         gate_score = gate_score.to(torch.bfloat16)
 
-        return self.indexer_op(
+        if dbg_small:
+            _dbg_attn_stage("indexer_proj_done")
+        out = self.indexer_op(
             hidden_states,
             q_fp8,
             k,
@@ -439,6 +454,9 @@ class Indexer(nn.Module):
             index_kpool=self.index_kpool,
             positions=positions,
         )
+        if dbg_small:
+            _dbg_attn_stage("indexer_op_done")
+        return out
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -668,5 +686,11 @@ class Glm5NextMLAAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
+        dbg_small = positions.shape[0] <= 32
+        if dbg_small:
+            _dbg_attn_stage(f"mla_enter tokens={positions.shape[0]}")
         # The wrapper also runs the sparse indexer before MLA attention.
-        return self.mla_attn(positions, hidden_states)
+        out = self.mla_attn(positions, hidden_states)
+        if dbg_small:
+            _dbg_attn_stage("mla_done")
+        return out

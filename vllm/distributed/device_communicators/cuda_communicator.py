@@ -3,6 +3,7 @@
 
 
 import os
+import sys
 
 import torch
 from torch.distributed import ProcessGroup
@@ -26,6 +27,74 @@ from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# ---- Collective sequence tracer (debugging) ----
+# Enabled with VLLM_TRACE_COLLECTIVES=1. Writes one file per rank under
+# VLLM_TRACE_COLLECTIVES_PATH (default /tmp/collective_traces).
+# Each line: seq=<n> op=<op> args=[shapes] callers=<chain>
+# On hang: diff rank_*.log files. Same seq+shape on all ranks means all
+# ranks are in the same collective (kernel/backend hang). Diverged seq
+# numbers mean rank-divergent control flow; the first divergent line is
+# the bug.
+
+_TRACE_FH = None
+_TRACE_SEQ = 0
+_TRACE_ENABLED = None
+
+
+def _trace_init(rank: int) -> bool:
+    global _TRACE_ENABLED, _TRACE_FH
+    if _TRACE_ENABLED is not None:
+        return _TRACE_ENABLED
+    _TRACE_ENABLED = os.getenv("VLLM_TRACE_COLLECTIVES", "0") == "1"
+    print(
+        f"TRACE_INIT rank={rank} enabled={_TRACE_ENABLED} "
+        f"path={os.getenv('VLLM_TRACE_COLLECTIVES_PATH', '/tmp/collective_traces')} "
+        f"pid={os.getpid()}",
+        file=sys.stderr, flush=True,
+    )
+    if _TRACE_ENABLED:
+        import time as _time
+        path = os.getenv(
+            "VLLM_TRACE_COLLECTIVES_PATH", "/tmp/collective_traces"
+        )
+        os.makedirs(path, exist_ok=True)
+        try:
+            _TRACE_FH = open(
+                os.path.join(path, f"rank_{rank}.log"), "w", buffering=1
+            )
+            _TRACE_FH.write(
+                f"# trace_start t={_time.time():.3f} pid={os.getpid()}\n"
+            )
+        except OSError as e:
+            print(f"TRACE_INIT FAILED rank={rank}: {e}", file=sys.stderr, flush=True)
+            _TRACE_ENABLED = False
+    return _TRACE_ENABLED
+
+
+def _trace_collective(rank: int, op: str, *tensors) -> None:
+    global _TRACE_SEQ
+    if not _trace_init(rank):
+        return
+    import time as _time
+    _TRACE_SEQ += 1
+    names = []
+    f = sys._getframe(1)
+    for _ in range(18):
+        if f is None:
+            break
+        n = f.f_code.co_name
+        if n:
+            names.append(n)
+        f = f.f_back
+    shapes = [
+        f"{tuple(t.shape)}:{t.dtype}" if isinstance(t, torch.Tensor) else str(t)
+        for t in tensors
+    ]
+    _TRACE_FH.write(
+        f"t={_time.time():.3f} seq={_TRACE_SEQ} op={op} args=[{', '.join(shapes)}] "
+        f"callers={' <- '.join(names[:15])}\n"
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -363,6 +432,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        _trace_collective(self.rank, "all_reduce", input_)
         # Opt-in gfx10x oneshot. Only constructed when VLLM_RDNA_AR=1, so
         # this is a no-op on the default CUSTOM / RCCL path.
         rdna_ar_comm = self.rdna_ar_comm
@@ -455,6 +525,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return ca_comm.custom_reduce_scatter(input_.contiguous())
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        _trace_collective(self.rank, "all_gather", input_, dim)
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
         # enabled (mirrors reduce_scatter); otherwise fall back to the
         # PyNccl/base-class all-gather. Sequence parallelism's
@@ -491,6 +562,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        _trace_collective(self.rank, "reduce_scatter", input_, dim)
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -520,6 +592,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
+        _trace_collective(self.rank, "reduce_scatterv", input_, dim)
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -770,6 +843,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        _trace_collective(self.rank, "all_gatherv", input_, dim)
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
